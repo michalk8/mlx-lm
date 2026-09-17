@@ -466,40 +466,31 @@ class Model(nn.Module):
                         ]
                         weights[f"{prefix}.mlp.switch_mlp.{m}.{k}"] = mx.stack(to_join)
 
-            # Absorb kv_b_proj into embed_q / unembed_out.
+            # Absorb kv_b_proj into embed_q / unembed_out. No scales keeps them
+            # unquantized, because mx.quantize is not idempotent.
             # TODO: affine only; non-affine modes have no biases key.
             attn = f"{prefix}.self_attn"
             if f"{attn}.kv_b_proj.weight" in weights:
-                quantized = f"{attn}.kv_b_proj.scales" in weights
                 w = weights.pop(f"{attn}.kv_b_proj.weight")
                 head_dim = self.args.qk_nope_head_dim + self.args.v_head_dim
-                if quantized:
+                if f"{attn}.kv_b_proj.scales" in weights:
                     dims = self.args.kv_lora_rank
                     scales = weights.pop(f"{attn}.kv_b_proj.scales")
                     biases = weights.pop(f"{attn}.kv_b_proj.biases")
-                    bits = (w.shape[-1] * 32) // dims
-                    group_size = dims // scales.shape[-1]
                     w = mx.dequantize(
-                        w, scales, biases, bits=bits, group_size=group_size
+                        w,
+                        scales,
+                        biases,
+                        bits=(w.shape[-1] * 32) // dims,
+                        group_size=dims // scales.shape[-1],
                     )
                 w = w.reshape(self.args.num_attention_heads, head_dim, -1)
-                wk = mx.contiguous(
+                weights[f"{attn}.embed_q.weight"] = mx.contiguous(
                     w[:, : self.args.qk_nope_head_dim, :].swapaxes(-1, -2)
                 )
-                wv = mx.contiguous(w[:, self.args.qk_nope_head_dim :, :])
-                if quantized:
-                    wk, wk_scales, wk_biases = mx.quantize(
-                        wk, bits=bits, group_size=group_size
-                    )
-                    wv, wv_scales, wv_biases = mx.quantize(
-                        wv, bits=bits, group_size=group_size
-                    )
-                    weights[f"{attn}.embed_q.scales"] = wk_scales
-                    weights[f"{attn}.embed_q.biases"] = wk_biases
-                    weights[f"{attn}.unembed_out.scales"] = wv_scales
-                    weights[f"{attn}.unembed_out.biases"] = wv_biases
-                weights[f"{attn}.embed_q.weight"] = wk
-                weights[f"{attn}.unembed_out.weight"] = wv
+                weights[f"{attn}.unembed_out.weight"] = mx.contiguous(
+                    w[:, self.args.qk_nope_head_dim :, :]
+                )
 
         return {k: v for k, v in weights.items() if "rotary_emb.inv_freq" not in k}
 

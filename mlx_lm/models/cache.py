@@ -951,8 +951,10 @@ class BatchKVCache(_BaseCache):
     def finalize(self):
         if self._right_padding is not None:
             padding = self._right_padding
-            self.keys = dynamic_roll(self.keys, padding[:, None], axis=2)
-            self.values = dynamic_roll(self.values, padding[:, None], axis=2)
+            self.keys, self.values = tree_map(
+                lambda x: dynamic_roll(x, padding[:, None], axis=2),
+                (self.keys, self.values),
+            )
             self.offset = self.offset - padding
             self.left_padding += padding
             self._right_padding = None
@@ -984,8 +986,8 @@ class BatchKVCache(_BaseCache):
         In-place filter to keep just the given indices in the cache.
         """
         if self.keys is not None:
-            self.keys = self.keys[batch_indices]
-            self.values = self.values[batch_indices]
+            self.keys = tree_map(lambda x: x[batch_indices], self.keys)
+            self.values = tree_map(lambda x: x[batch_indices], self.values)
         self.offset = self.offset[batch_indices]
         self.left_padding = self.left_padding[batch_indices]
 
@@ -993,8 +995,8 @@ class BatchKVCache(_BaseCache):
         min_left_pad = min(self.left_padding.tolist())
         if min_left_pad > 0:
             if self.keys is not None:
-                self.keys = self.keys[..., min_left_pad:, :]
-                self.values = self.values[..., min_left_pad:, :]
+                self.keys = tree_map(lambda x: x[..., min_left_pad:, :], self.keys)
+                self.values = tree_map(lambda x: x[..., min_left_pad:, :], self.values)
             self._idx -= min_left_pad
             self.left_padding -= min_left_pad
 
@@ -1008,39 +1010,44 @@ class BatchKVCache(_BaseCache):
             return
 
         max_idx = max(self._idx, other._idx)
-        L1 = L2 = 0
-        if self.keys is not None:
-            B, H, L1, D = self.keys.shape
-            M = self.values.shape[3]
-        if other.keys is not None:
-            B, H, L2, D = other.keys.shape
-            M = other.values.shape[3]
-        max_size = max(L1, L2)
-        dtype = (self.keys if self.keys is not None else other.keys).dtype
+        filled = self if self.keys is not None else other
+
+        def keys_values(c):
+            if c.keys is not None:
+                return c.keys, c.values
+            B = c.offset.shape[0]
+
+            def empty(x):
+                _, H, _, D = x.shape
+                return mx.zeros((B, H, 0, D), dtype=x.dtype)
+
+            return tree_map(empty, (filled.keys, filled.values))
 
         # Pad the keys and values so they are right-justified
         # with the index and the same size
-        def pad(c):
-            k, v = c.keys, c.values
-            if k is None:
-                Bc = c.offset.shape[0]
-                k = mx.zeros((Bc, H, 0, D), dtype=dtype)
-                v = mx.zeros((Bc, H, 0, M), dtype=dtype)
+        def pad(c, x, max_size):
             left = max_idx - c._idx
-            right = max_size - k.shape[2] - left
+            right = max_size - x.shape[2] - left
             if right < 0:
-                k = k[..., :right, :]
-                v = v[..., :right, :]
+                x = x[..., :right, :]
                 right = 0
             if left != 0 or right != 0:
-                pad = [(0, 0), (0, 0), (left, right), (0, 0)]
-                k = mx.pad(k, pad)
-                v = mx.pad(v, pad)
-            left_padding = c.left_padding + left
-            return k, v, c.offset, left_padding
+                x = mx.pad(x, [(0, 0), (0, 0), (left, right), (0, 0)])
+            return x
 
-        self.keys, self.values, self.offset, self.left_padding = map(
-            mx.concatenate, zip(*(pad(self), pad(other)))
+        def concatenate(x, y):
+            max_size = max(x.shape[2], y.shape[2])
+            return mx.concatenate([pad(self, x, max_size), pad(other, y, max_size)])
+
+        self.keys, self.values = tree_map(
+            concatenate, keys_values(self), keys_values(other)
+        )
+        self.offset = mx.concatenate([self.offset, other.offset])
+        self.left_padding = mx.concatenate(
+            [
+                self.left_padding + (max_idx - self._idx),
+                other.left_padding + (max_idx - other._idx),
+            ]
         )
         self._idx = max_idx
 
@@ -1060,28 +1067,32 @@ class BatchKVCache(_BaseCache):
 
         # No cache has content so make an empty one
         if max_length == 0:
-            return BatchKVCache([0] * len(caches))
+            return cls([0] * len(caches))
 
         padding = [max_length - l for l in lengths]
         B = len(caches)
-        H = max(c.keys.shape[1] for c in caches if c.keys is not None)
-        Dk = max(c.keys.shape[3] for c in caches if c.keys is not None)
-        Dv = max(c.values.shape[3] for c in caches if c.values is not None)
-        dt = next(iter(c.keys.dtype for c in caches if c.keys is not None))
+        filled = next(c for c in caches if c.keys is not None)
 
-        keys = mx.zeros((B, H, max_length, Dk), dtype=dt)
-        values = mx.zeros((B, H, max_length, Dv), dtype=dt)
+        def zeros(x):
+            _, H, _, D = x.shape
+            return mx.zeros((B, H, max_length, D), dtype=x.dtype)
+
+        keys, values = tree_map(zeros, (filled.keys, filled.values))
         for i, (p, c) in enumerate(zip(padding, caches)):
             if c.keys is None:
                 continue
-            keys[i : i + 1, :, p : p + c.offset] = c.keys[..., : c.offset, :]
-            values[i : i + 1, :, p : p + c.offset] = c.values[..., : c.offset, :]
+
+            def write(x, y):
+                x[i : i + 1, :, p : p + c.offset] = y[..., : c.offset, :]
+                return x
+
+            keys, values = tree_map(write, (keys, values), (c.keys, c.values))
 
         cache = cls(padding)
         cache.keys = keys
         cache.values = values
-        cache.offset += keys.shape[2]
-        cache._idx = keys.shape[2]
+        cache.offset += max_length
+        cache._idx = max_length
 
         return cache
 
@@ -1095,7 +1106,7 @@ class BatchKVCache(_BaseCache):
     def nbytes(self):
         if self.keys is None:
             return 0
-        return self.keys.nbytes + self.values.nbytes
+        return tree_reduce(lambda a, x: a + x.nbytes, (self.keys, self.values), 0)
 
 
 class BatchRotatingKVCache(_BaseCache):

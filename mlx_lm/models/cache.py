@@ -309,6 +309,9 @@ class QuantizedKVCache(_BaseCache):
                 lambda x: x[..., : self.offset, :], (self.keys, self.values)
             )
 
+    def size(self):
+        return self.offset
+
     @property
     def state(self):
         return self.keys, self.values, self.offset, self.group_size, self.bits
@@ -328,11 +331,17 @@ class QuantizedKVCache(_BaseCache):
     def make_mask(self, *args, **kwargs):
         return create_attention_mask(*args, offset=self.offset, **kwargs)
 
+    @classmethod
+    def merge(_, caches):
+        return BatchQuantizedKVCache.merge(caches)
+
     def empty(self):
         return self.keys is None
 
     @property
     def nbytes(self):
+        if self.keys is None:
+            return 0
         return tree_reduce(lambda a, x: a + x.nbytes, (self.keys, self.values), 0)
 
 
@@ -1107,6 +1116,95 @@ class BatchKVCache(_BaseCache):
         if self.keys is None:
             return 0
         return tree_reduce(lambda a, x: a + x.nbytes, (self.keys, self.values), 0)
+
+
+class BatchQuantizedKVCache(BatchKVCache):
+    """
+    A ``BatchKVCache`` that stores the keys and values quantized, as
+    ``QuantizedKVCache`` does.
+    """
+
+    def __init__(self, left_padding: List[int], *, group_size: int = 64, bits: int = 8):
+        super().__init__(left_padding)
+        self.group_size = group_size
+        self.bits = bits
+
+    def update_and_fetch(self, keys, values):
+        keys = mx.quantize(keys, group_size=self.group_size, bits=self.bits)
+        values = mx.quantize(values, group_size=self.group_size, bits=self.bits)
+        prev = self._idx
+        num_steps = keys[0].shape[2]
+        if self.keys is None or (prev + num_steps) > self.keys[0].shape[2]:
+            n_steps = (self.step + num_steps - 1) // self.step
+
+            def zeros(x):
+                shape = (*x.shape[:2], n_steps * self.step, x.shape[3])
+                return mx.zeros(shape, dtype=x.dtype)
+
+            new_k, new_v = tree_map(zeros, (keys, values))
+            if self.keys is not None:
+                if prev % self.step != 0:
+                    self.keys, self.values = tree_map(
+                        lambda x: x[..., :prev, :], (self.keys, self.values)
+                    )
+                self.keys, self.values = tree_map(
+                    lambda x, y: mx.concatenate([x, y], axis=2),
+                    (self.keys, self.values),
+                    (new_k, new_v),
+                )
+            else:
+                self.keys, self.values = new_k, new_v
+
+        self.offset = self.offset + num_steps
+        self._idx += num_steps
+        for x, y in zip((*self.keys, *self.values), (*keys, *values), strict=True):
+            x[..., prev : self._idx, :] = y
+        return self.keys_and_values()
+
+    def keys_and_values(self):
+        return tree_map(lambda x: x[..., : self._idx, :], (self.keys, self.values))
+
+    @property
+    def state(self):
+        return (
+            self.keys,
+            self.values,
+            self.offset,
+            self.left_padding,
+            self._idx,
+            self.group_size,
+            self.bits,
+        )
+
+    @state.setter
+    def state(self, v):
+        (
+            self.keys,
+            self.values,
+            self.offset,
+            self.left_padding,
+            self._idx,
+            self.group_size,
+            self.bits,
+        ) = v
+
+    def extract(self, idx):
+        cache = QuantizedKVCache(group_size=self.group_size, bits=self.bits)
+        mx.eval(self.left_padding)
+        padding = self.left_padding.tolist()[idx]
+        cache.keys, cache.values = tree_map(
+            lambda x: mx.contiguous(x[idx : idx + 1, :, padding : self._idx]),
+            (self.keys, self.values),
+        )
+        cache.offset = self._idx - padding
+        return cache
+
+    @classmethod
+    def merge(cls, caches):
+        cache = super().merge(caches)
+        cache.group_size = caches[0].group_size
+        cache.bits = caches[0].bits
+        return cache
 
 
 class BatchRotatingKVCache(_BaseCache):

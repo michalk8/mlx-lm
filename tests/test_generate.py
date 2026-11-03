@@ -17,7 +17,7 @@ from mlx_lm.generate import (
     speculative_generate_step,
     stream_generate,
 )
-from mlx_lm.models.cache import KVCache, RotatingKVCache
+from mlx_lm.models.cache import KVCache, QuantizedKVCache, RotatingKVCache
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.utils import load
 
@@ -715,6 +715,24 @@ class TestGenerate(unittest.TestCase):
                 self.assertTrue(
                     mx.allclose(batch_logprobs, logprobs, rtol=1e-4, atol=1e-4)
                 )
+
+    def test_batch_quantized_matches_single(self):
+        prompts, max_tokens = [[1, 2, 3, 4, 5], [6, 7], [8, 9, 10]], [3, 6, 4]
+        caches = [[QuantizedKVCache() for _ in self.model.layers] for _ in prompts]
+        for p, c in zip(prompts, caches, strict=True):
+            self.model(mx.array(p[:-1])[None], cache=c)
+        gen = BatchGenerator(self.model, prefill_batch_size=2, completion_batch_size=3)
+        uids = gen.insert([p[-1:] for p in prompts], max_tokens, caches=caches)
+        tokens = {uid: [] for uid in uids}
+        while responses := gen.next_generated():
+            for r in responses:
+                tokens[r.uid].append(r.token)
+        for uid, p, m in zip(uids, prompts, max_tokens, strict=True):
+            cache = [QuantizedKVCache() for _ in self.model.layers]
+            steps = generate_step(
+                mx.array(p), self.model, max_tokens=m, prompt_cache=cache
+            )
+            self.assertEqual(tokens[uid], [t for t, _ in steps])
 
     def test_batch_continued_generation_ssm(self):
         from mlx_lm.models import mamba2

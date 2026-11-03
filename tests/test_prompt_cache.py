@@ -645,6 +645,32 @@ class TestPromptCache(unittest.TestCase):
             if isinstance(c, BatchRotatingKVCache):
                 self.assertEqual(c.rotated, lc.rotated)
 
+    def test_batch_quantized_kv_cache(self):
+        rows = [QuantizedKVCache(group_size=32, bits=4) for _ in range(3)]
+        self.assertEqual(rows[2].nbytes, 0)
+        for c, n in zip(rows[:2], [5, 2], strict=True):
+            kv = mx.random.normal((1, 2, n, 32))
+            c.update_and_fetch(kv, kv)
+        batch = QuantizedKVCache.merge(rows[:2])
+        batch.extend(QuantizedKVCache.merge(rows[2:]))
+
+        # Row 0 gets one token and one right pad
+        kv = mx.random.normal((3, 2, 2, 32))
+        batch.prepare(right_padding=[1, 0, 0])
+        batch.update_and_fetch(kv, kv)
+        batch.finalize()
+        for c, x, n in zip(rows, kv, [1, 2, 2], strict=True):
+            c.update_and_fetch(x[None, :, :n], x[None, :, :n])
+        batch.filter([0, 2])
+
+        cache_file = os.path.join(self.test_dir, "prompt_cache.safetensors")
+        save_prompt_cache(cache_file, [batch])
+        (batch,) = load_prompt_cache(cache_file)
+        for i, c in enumerate([rows[0], rows[2]]):
+            (k, v), (ck, cv) = batch.extract(i).keys_and_values(), c.keys_and_values()
+            for x, y in zip([*k, *v], [*ck, *cv], strict=True):
+                self.assertTrue(mx.array_equal(x, y))
+
     def test_rotating_cache_updates(self):
         cache = RotatingKVCache(max_size=8)
         k = v = mx.zeros((1, 1, 10, 1))

@@ -1,6 +1,8 @@
+# Copyright © 2026 Apple Inc.
+
 # MLX port of Qwen3.8-Flash-Next (HF model_type: qwen4_exp)
 # New compared to qwen3_next: QSA sparse attention, gated residual
-# (hyper-connections), sharded n-gram / PLE embedding, split deltanet projections.
+# (hyper-connections), n-gram / PLE embedding, split deltanet projections.
 
 from __future__ import annotations
 
@@ -11,7 +13,6 @@ from typing import Any, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 
 from .base import (
     BaseModelArgs,
@@ -535,23 +536,26 @@ class GatedResidual(nn.Module):
         super().__init__()
         self.hc = args.hc_count
         self.d = args.hidden_size
+        self.lowrank = args.hc_lowrank
+        self.use_combine = use_combine
         hc_dim = self.hc * self.d
         self.hc_norm = RMSNorm(hc_dim, group_size=self.d, eps=args.rms_norm_eps)
-        self.input_mix_weight_down = nn.Linear(hc_dim, args.hc_lowrank, bias=False)
-        self.input_mix_weight_up = nn.Linear(args.hc_lowrank, hc_dim, bias=False)
-        self.block_inject_weight = (
-            nn.Linear(hc_dim, self.hc, bias=False) if use_combine else None
-        )
+        # With `use_combine`, the last hc rows hold the checkpoint's
+        # block_inject_weight: one matmul for both.
+        down = self.lowrank + (self.hc if use_combine else 0)
+        self.input_mix_weight_down = nn.Linear(hc_dim, down, bias=False)
+        self.input_mix_weight_up = nn.Linear(self.lowrank, hc_dim, bias=False)
 
     def __call__(self, hyper: mx.array):
         normed = self.hc_norm(hyper)
-        w = nn.silu(self.input_mix_weight_down(normed) / self.hc)
+        down = self.input_mix_weight_down(normed)
+        w = nn.silu(down[..., : self.lowrank] / self.hc)
         w = mx.sigmoid(self.input_mix_weight_up(w))
         w = w.reshape(*w.shape[:-1], self.hc, self.d)
         mixed = (w * normed.reshape(*normed.shape[:-1], self.hc, self.d)).mean(axis=-2)
-        if self.block_inject_weight is None:
+        if not self.use_combine:
             return mixed
-        inject = 2 * mx.sigmoid(self.block_inject_weight(normed) / self.hc)
+        inject = 2 * mx.sigmoid(down[..., self.lowrank :] / self.hc)
         return mixed, hyper, inject
 
 
@@ -589,10 +593,10 @@ def _nth_prime_after(start: int, count: int) -> int:
 
 
 class NGramEmbedding(nn.Module):
-    """N-gram hash table, sharded into `split_ngram_parts` pieces.
+    """N-gram hash table, ~51B parameters.
 
-    ~51B parameters: a dense lookup is never performed. Indices are sorted by shard
-    on the host side, as in the llama.cpp implementation.
+    The checkpoint splits it into `split_ngram_parts` shards and `sanitize`
+    joins them, so a lookup is one gather on the GPU, with no host sync.
     """
 
     def __init__(self, args: TextArgs, embed_dim: int, ple_layer_index: int = 0):
@@ -621,8 +625,8 @@ class NGramEmbedding(nn.Module):
         padded = math.ceil(total / div) * div
         self.n_shards = args.split_ngram_parts
         self.rows_per_shard = math.ceil(padded / self.n_shards)
-        self.ngram_embedding = _ShardedEmbedding(
-            self.n_shards, self.rows_per_shard, head_dim
+        self.ngram_embedding = nn.Embedding(
+            self.n_shards * self.rows_per_shard, head_dim
         )
 
         # buffers taken as-is from the checkpoint
@@ -686,33 +690,6 @@ class NGramEmbedding(nn.Module):
 
 
 _NGRAM_SHARD_RE = re.compile(r"\.ngram_embedding\.shard_(\d+)\.")
-
-
-class _ShardedEmbedding(nn.Module):
-    """N embedding tables concatenated logically, addressed by global index."""
-
-    def __init__(self, n_shards: int, rows: int, dim: int):
-        super().__init__()
-        self.n_shards = n_shards
-        self.rows = rows
-        self.dim = dim
-        # a list, so the keys are `shards.{i}.weight`: the layout mlx-vlm writes
-        # and `nn.quantize` walks; `sanitize` maps the HF `shard_{i}` onto it
-        self.shards = [nn.Embedding(rows, dim) for _ in range(n_shards)]
-
-    def __call__(self, gid: mx.array) -> mx.array:
-        flat = gid.reshape(-1)
-        shard_of = flat // self.rows
-        row_of = flat % self.rows
-
-        # which shards are actually touched: decided host-side, as llama.cpp does
-        touched = np.unique(np.array(shard_of, copy=False))
-        out = mx.zeros((flat.size, self.dim), dtype=mx.float32)
-        for s in touched.tolist():
-            sel = mx.array(np.nonzero(np.array(shard_of, copy=False) == s)[0])
-            emb = self.shards[s](mx.take(row_of, sel))
-            out = mx.put_along_axis(out, sel[:, None], emb.astype(mx.float32), axis=0)
-        return out.reshape(*gid.shape, self.dim)
 
 
 class PLELayer(nn.Module):
@@ -1063,6 +1040,17 @@ class _LayerCache(ArraysCache):
         super().prepare(lengths=lengths, **kwargs)
 
 
+def _merge_linears(weights: dict, parts: list, target: str):
+    """Concatenate the layers `parts` into `target` along the output axis,
+    with their scales and biases when quantized."""
+    for name in ("weight", "scales", "biases"):
+        keys = [f"{p}.{name}" for p in parts]
+        if all(k in weights for k in keys):
+            weights[f"{target}.{name}"] = mx.concatenate(
+                [weights.pop(k) for k in keys], axis=-2
+            )
+
+
 class Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -1086,7 +1074,7 @@ class Model(nn.Module):
 
     def make_cache(self):
         caches = []
-        for i, t in enumerate(self.args.text.layer_types):
+        for t in self.args.text.layer_types:
             if t == "full_attention":
                 caches.append(_AttnCache())
             else:
@@ -1166,6 +1154,18 @@ class Model(nn.Module):
                 v = 1.0 + v
 
             out[k] = v
+
+        # The checkpoint keeps the hyper-connections' block inject apart from
+        # their mix down.
+        for k in [k for k in out if k.endswith("block_inject_weight.weight")]:
+            p = k[: -len("block_inject_weight.weight")]
+            down = p + "input_mix_weight_down"
+            _merge_linears(out, [down, p + "block_inject_weight"], down)
+        # The n-gram table: the checkpoint's shards, in order.
+        for k in [k for k in out if k.endswith("ngram_embedding.shards.0.weight")]:
+            p = k[: -len("0.weight")]
+            n = sum(q.startswith(p) and q.endswith(".weight") for q in out)
+            _merge_linears(out, [f"{p}{i}" for i in range(n)], p[: -len(".shards.")])
         return out
 
     _NGRAM_CONSTANTS = (

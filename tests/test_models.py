@@ -933,17 +933,27 @@ class TestModels(unittest.TestCase):
         )
         model = qwen4_exp.Model(args)
 
-        # The n-gram shards load under both names: `shard_{i}` (HF) and
-        # `shards.{i}` (this file, and mlx-vlm conversions).
+        # Older MLX conversions and the HF checkpoint split layers that this
+        # file merges; sanitize merges them back.
         weights = dict(tree_flatten(model.parameters()))
-        shard_keys = [k for k in weights if ".ngram_embedding.shards." in k]
-        self.assertEqual(len(shard_keys), 4)
-        hf = {
-            k.replace(".ngram_embedding.shards.", ".ngram_embedding.shard_"): v
-            for k, v in weights.items()
-        }
-        self.assertEqual(set(model.sanitize(hf)), set(weights))
         self.assertEqual(set(model.sanitize(weights)), set(weights))
+        old = dict(weights)
+        for k in [
+            k for k in old if k.endswith("_connection.input_mix_weight_down.weight")
+        ]:
+            down, inject = mx.split(old[k], [args.text.hc_lowrank], axis=-2)
+            old[k] = down
+            old[k.replace("input_mix_weight_down", "block_inject_weight")] = inject
+        # The n-gram shards come as `shard_{i}` (HF) or `shards.{i}` (mlx-vlm).
+        for k in [k for k in old if k.endswith("ngram_embedding.weight")]:
+            for i, w in enumerate(mx.split(old.pop(k), 4, axis=0)):
+                old[k.replace(".weight", f".shards.{i}.weight")] = w
+        hf = {k.replace(".shards.", ".shard_"): v for k, v in old.items()}
+        for split in (old, hf):
+            merged = model.sanitize(split)
+            self.assertEqual(set(merged), set(weights))
+            for k, v in weights.items():
+                self.assertTrue(mx.array_equal(merged[k], v), k)
 
         self.model_test_runner(
             model, args.model_type, args.text.vocab_size, args.text.num_hidden_layers

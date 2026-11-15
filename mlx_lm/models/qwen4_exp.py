@@ -20,7 +20,7 @@ from .base import (
     create_ssm_mask,
     scaled_dot_product_attention,
 )
-from .cache import ArraysCache, BatchKVCache, KVCache, _BaseCache, dynamic_roll
+from .cache import ArraysCache, CacheList, KVCache
 from .gated_delta import gated_delta_update
 from .switch_layers import SwitchGLU
 
@@ -234,7 +234,10 @@ class QSAIndexer(nn.Module):
         raw_k = qk[..., split:].reshape(B, S, self.head_dim)
 
         if cache is not None:
-            raw_k = cache.update(raw_k)
+            # As in deepseek_v32: a KVCache for the keys, zeros for the values.
+            raw_k, _ = cache.update_and_fetch(raw_k[:, None], raw_k[:, None])
+            cache.values = mx.zeros_like(cache.keys)
+            raw_k = raw_k[:, 0]
         kv_len = raw_k.shape[1]
 
         # No sparsification possible: every visible token fits in the budget, so the
@@ -361,11 +364,15 @@ class Attention(nn.Module):
         self.k_norm = RMSNorm(self.head_dim, eps=args.rms_norm_eps)
         self.indexer = QSAIndexer(args)
 
-    def __call__(self, x, rope, mask, cache, idx_cache) -> mx.array:
+    def __call__(self, x, rope, mask, cache) -> mx.array:
         B, S, _ = x.shape
-        offset = cache.offset if cache is not None else 0
+        # `cache` holds the attention keys and values, then the indexer keys.
+        kv_cache, idx_cache = (
+            (cache[0], cache[1]) if cache is not None else (None, None)
+        )
+        offset = kv_cache.offset if kv_cache is not None else 0
 
-        sparse = self.indexer(x, rope, idx_cache, offset, _left_padding(cache))
+        sparse = self.indexer(x, rope, idx_cache, offset, _left_padding(kv_cache))
 
         q, gate = mx.split(self.q_proj(x).reshape(B, S, self.n_heads, -1), 2, axis=-1)
         gate = gate.reshape(B, S, -1)
@@ -379,8 +386,8 @@ class Attention(nn.Module):
         cos, sin = cos[:, None], sin[:, None]
         q, k = _rope_partial(q, cos, sin), _rope_partial(k, cos, sin)
 
-        if cache is not None:
-            k, v = cache.update_and_fetch(k, v)
+        if kv_cache is not None:
+            k, v = kv_cache.update_and_fetch(k, v)
 
         if sparse is not None:
             # `sparse` is a boolean keep mask. Keep the combination boolean:
@@ -399,7 +406,7 @@ class Attention(nn.Module):
                 mask = mask + mx.where(sparse, mx.array(0, mask.dtype), neg)
 
         out = scaled_dot_product_attention(
-            q, k, v, cache=cache, scale=self.scale, mask=mask
+            q, k, v, cache=kv_cache, scale=self.scale, mask=mask
         )
         out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
         return self.o_proj(out * mx.sigmoid(gate))
@@ -773,7 +780,7 @@ class DecoderLayer(nn.Module):
         self.attn_hyper_connection = GatedResidual(args)
         self.mlp_hyper_connection = GatedResidual(args)
 
-    def __call__(self, h, rope, mask, conv_mask, cache, idx_cache, ids, prev_ctx):
+    def __call__(self, h, rope, mask, conv_mask, cache, ids, prev_ctx):
         if self.ple is not None:
             h = h + self.ple(h, ids, prev_ctx, cache)
 
@@ -781,7 +788,7 @@ class DecoderLayer(nn.Module):
         if self.layer_type == "linear_attention":
             x = self.linear_attn(x, conv_mask, cache)
         else:
-            x = self.self_attn(x, rope, mask, cache, idx_cache)
+            x = self.self_attn(x, rope, mask, cache)
         h = hyper + (x[..., None, :] * inject[..., None]).reshape(*x.shape[:-1], -1)
 
         x, hyper, inject = self.mlp_hyper_connection(h)
@@ -815,7 +822,10 @@ class Qwen4ExpModel(nn.Module):
         lin_idx = [
             i for i, l in enumerate(self.layers) if l.layer_type == "linear_attention"
         ]
-        mask = create_attention_mask(h, cache[full_idx[0]] if full_idx else None)
+        attn_cache = cache[full_idx[0]] if full_idx else None
+        mask = create_attention_mask(
+            h, attn_cache[0] if attn_cache is not None else None
+        )
         # The deltanet reads the tokens in order, so it needs the padded ones
         # zeroed out. Its cache holds the padding, one value per row.
         conv_mask = create_ssm_mask(h, cache[lin_idx[0]]) if lin_idx else None
@@ -846,159 +856,8 @@ class Qwen4ExpModel(nn.Module):
 
         h = mx.tile(h, (1, 1, self.hc))
         for layer, c in zip(self.layers, cache):
-            idx_c = c.indexer if (c is not None and hasattr(c, "indexer")) else None
-            h = layer(h, self.rope, mask, conv_mask, c, idx_c, ids, prev_ctx)
+            h = layer(h, self.rope, mask, conv_mask, c, ids, prev_ctx)
         return self.hyper_connection_mixer(h)
-
-
-class _IndexerCache(_BaseCache):
-    """Holds the indexer raw keys (one per token, not pooled)."""
-
-    def __init__(self):
-        self.keys = None
-
-    def update(self, k: mx.array) -> mx.array:
-        self.keys = k if self.keys is None else mx.concatenate([self.keys, k], axis=1)
-        return self.keys
-
-    def trim(self, size: int):
-        if self.keys is not None:
-            self.keys = self.keys[:, :size]
-
-    @property
-    def state(self):
-        # `None` is not serializable, so an empty array stands for it.
-        return mx.array([]) if self.keys is None else self.keys
-
-    @state.setter
-    def state(self, v):
-        self.keys = v if v.size > 0 else None
-
-
-class _AttnCache(KVCache):
-    def __init__(self):
-        super().__init__()
-        self.indexer = _IndexerCache()
-
-    def trim(self, n):
-        # `KVCache.trim` only moves the offset, but the indexer keys are exact.
-        n = super().trim(n)
-        self.indexer.trim(self.offset)
-        return n
-
-    @property
-    def state(self):
-        return (*super().state, self.indexer.state)
-
-    @state.setter
-    def state(self, v):
-        *kv, self.indexer.state = v
-        KVCache.state.fset(self, tuple(kv))
-
-    @classmethod
-    def merge(cls, caches):
-        return _BatchAttnCache.merge(caches)
-
-
-class _BatchAttnCache(BatchKVCache):
-    """Batched `_AttnCache`. The indexer keys follow the KV padding exactly.
-
-    Credit: mirrors BatchQSAKVCache from Blaizzy/mlx-vlm#2028 (MIT).
-    """
-
-    def __init__(self, left_padding):
-        super().__init__(left_padding)
-        self.indexer = _IndexerCache()
-
-    def finalize(self):
-        # The base class rolls a right padded prefill into left padding. The
-        # indexer keys share those columns, so they take the same roll.
-        padding = self._right_padding
-        super().finalize()
-        if padding is not None and self.indexer.keys is not None:
-            self.indexer.keys = dynamic_roll(self.indexer.keys, padding, axis=1)
-
-    def trim(self, n):
-        n = super().trim(n)
-        self.indexer.trim(self._idx)
-        return n
-
-    def filter(self, batch_indices):
-        min_pad = self.left_padding[batch_indices].min().item()
-        super().filter(batch_indices)
-        if self.indexer.keys is not None:
-            keys = self.indexer.keys[batch_indices]
-            self.indexer.keys = keys[:, min_pad:] if min_pad else keys
-
-    def extend(self, other):
-        keys, other_keys = self.indexer.keys, other.indexer.keys
-        idx, other_idx = self._idx, other._idx
-        super().extend(other)
-        if keys is None and other_keys is None:
-            return
-        sample = keys if keys is not None else other_keys
-        target = max(idx, other_idx)
-        rows = self.offset.shape[0] - other.offset.shape[0]
-
-        # Right-justify both sides on the shared index, like `BatchKVCache`.
-        def pad(k, n_rows, used):
-            if k is None:
-                k = mx.zeros((n_rows, 0, sample.shape[-1]), dtype=sample.dtype)
-            return mx.pad(k[:, :used], [(0, 0), (target - used, 0), (0, 0)])
-
-        self.indexer.keys = mx.concatenate(
-            [pad(keys, rows, idx), pad(other_keys, other.offset.shape[0], other_idx)],
-            axis=0,
-        )
-
-    def extract(self, idx):
-        cache = _AttnCache()
-        pad = self.left_padding[idx].item()
-        if self.keys is not None:
-            cache.keys = mx.contiguous(self.keys[idx : idx + 1, :, pad : self._idx])
-            cache.values = mx.contiguous(self.values[idx : idx + 1, :, pad : self._idx])
-            cache.offset = cache.keys.shape[2]
-        if self.indexer.keys is not None:
-            cache.indexer.keys = mx.contiguous(
-                self.indexer.keys[idx : idx + 1, pad : self._idx]
-            )
-        return cache
-
-    @classmethod
-    def merge(cls, caches):
-        # `BatchKVCache.merge` names its own class on the all-empty path, which
-        # drops the indexer.
-        if max(c.size() for c in caches) == 0:
-            return cls([0] * len(caches))
-        out = super().merge(caches)
-        rows = [c.indexer.keys for c in caches]
-        sample = next((k for k in rows if k is not None), None)
-        if sample is None:
-            return out
-        out.indexer.keys = mx.concatenate(
-            [
-                (
-                    mx.zeros((1, out._idx, sample.shape[-1]), dtype=sample.dtype)
-                    if k is None
-                    else mx.pad(
-                        k[:, : c.offset],
-                        [(0, 0), (out._idx - c.offset, 0), (0, 0)],
-                    )
-                )
-                for k, c in zip(rows, caches)
-            ],
-            axis=0,
-        )
-        return out
-
-    @property
-    def state(self):
-        return (*super().state, self.indexer.state)
-
-    @state.setter
-    def state(self, v):
-        *kv, self.indexer.state = v
-        BatchKVCache.state.fset(self, tuple(kv))
 
 
 class _LayerCache(ArraysCache):
@@ -1076,7 +935,7 @@ class Model(nn.Module):
         caches = []
         for t in self.args.text.layer_types:
             if t == "full_attention":
-                caches.append(_AttnCache())
+                caches.append(CacheList(KVCache(), KVCache()))
             else:
                 # 0: deltanet conv, 1: ssm state, 2: PLE conv, 3: n-gram context
                 caches.append(_LayerCache(4))

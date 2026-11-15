@@ -860,45 +860,6 @@ class Qwen4ExpModel(nn.Module):
         return self.hyper_connection_mixer(h)
 
 
-class _LayerCache(ArraysCache):
-    """`ArraysCache` whose slots can stay unused on every row.
-
-    The PLE slots are only filled by the PLE layers, and `ArraysCache` raises
-    `StopIteration` on a slot that is `None` everywhere.
-    """
-
-    @classmethod
-    def merge(cls, caches):
-        n_state = len(caches[0].cache)
-        B = len(caches)
-        cache = cls(n_state)
-        if all(c.empty() for c in caches):
-            cache.left_padding = mx.array([0] * B)
-            return cache
-        for e in range(n_state):
-            c_init = next((c[e] for c in caches if c[e] is not None), None)
-            if c_init is None:
-                continue
-            shape = list(c_init.shape)
-            shape[0] = B
-            cache[e] = mx.zeros(shape, c_init.dtype)
-            for i in range(B):
-                if caches[i][e] is not None:
-                    cache[e][i : i + 1] = caches[i][e]
-        return cache
-
-    def extract(self, idx):
-        cache = _LayerCache(len(self.cache))
-        cache.cache = [None if c is None else c[idx : idx + 1] for c in self.cache]
-        return cache
-
-    def prepare(self, lengths=None, **kwargs):
-        # An empty merge leaves a zero `left_padding`, which shadows `lengths`
-        # in `make_mask` and lets the right padding into the deltanet.
-        self.left_padding = None
-        super().prepare(lengths=lengths, **kwargs)
-
-
 def _merge_linears(weights: dict, parts: list, target: str):
     """Concatenate the layers `parts` into `target` along the output axis,
     with their scales and biases when quantized."""
@@ -933,12 +894,14 @@ class Model(nn.Module):
 
     def make_cache(self):
         caches = []
-        for t in self.args.text.layer_types:
+        for i, t in enumerate(self.args.text.layer_types):
             if t == "full_attention":
                 caches.append(CacheList(KVCache(), KVCache()))
             else:
-                # 0: deltanet conv, 1: ssm state, 2: PLE conv, 3: n-gram context
-                caches.append(_LayerCache(4))
+                # The deltanet conv and recurrent state; a PLE layer adds its
+                # conv state and n-gram context.
+                num_states = 4 if i in self.model.ple_layers else 2
+                caches.append(ArraysCache(num_states))
         return caches
 
     # Norms scaled by `1 + w` in the reference (RMSNorm above); `linear_attn.norm` is

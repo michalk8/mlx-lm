@@ -195,9 +195,8 @@ class QSAIndexer(nn.Module):
         # With left padding, each row's blocks start at its first real token.
         pad = getattr(cache, "left_padding", None)
         if cache is not None:
-            raw_k, _ = cache.update_and_fetch(raw_k[:, None], raw_k[:, None])
-            # Nothing reads the values: reset them, so their graph cannot grow.
-            cache.values = mx.zeros_like(cache.keys)
+            # Nothing reads the values: store them with zero width.
+            raw_k, _ = cache.update_and_fetch(raw_k[:, None], raw_k[:, None, :, :0])
             raw_k = raw_k[:, 0]
         kv_len = raw_k.shape[1]
 

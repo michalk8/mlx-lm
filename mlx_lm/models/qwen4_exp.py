@@ -153,33 +153,7 @@ class RMSNormGated(nn.Module):
         return (g * out.astype(mx.float32)).astype(x.dtype)
 
 
-# ------------------------------------------------------------------- rope / helpers
-
-
-def _rope_partial(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
-    """Apply rope to the first `rotary_dim` dimensions only."""
-    d = cos.shape[-1]
-    # cos/sin are computed in float32: without this cast they promote x and the
-    # whole attention falls back to float32.
-    cos, sin = cos.astype(x.dtype), sin.astype(x.dtype)
-    xr, xp = x[..., :d], x[..., d:]
-    half = d // 2
-    x1, x2 = xr[..., :half], xr[..., half:]
-    rot = mx.concatenate([-x2, x1], axis=-1)
-    xr = xr * cos + rot * sin
-    return mx.concatenate([xr, xp], axis=-1) if xp.shape[-1] else xr
-
-
-class RotaryEmbedding:
-    def __init__(self, dim: int, base: float):
-        self.dim = dim
-        self.inv_freq = base ** (-mx.arange(0, dim, 2, dtype=mx.float32) / dim)
-
-    def __call__(self, positions: mx.array):
-        # positions: (B, T) -> cos/sin (B, T, dim)
-        freqs = positions.astype(mx.float32)[..., None] * self.inv_freq
-        emb = mx.concatenate([freqs, freqs], axis=-1)
-        return mx.cos(emb), mx.sin(emb)
+# ------------------------------------------------------------------------ helpers
 
 
 def _positions(offset: Union[int, mx.array], S: int) -> mx.array:
@@ -225,8 +199,14 @@ class QSAIndexer(nn.Module):
         )
         self.q_layernorm = RMSNorm(self.head_dim, eps=args.rms_norm_eps)
         self.k_layernorm = RMSNorm(self.head_dim, eps=args.rms_norm_eps)
+        rotary_dim = int(args.head_dim * args.partial_rotary_factor)
+        self.rope = nn.RoPE(rotary_dim, base=args.rope_theta)
+        # Block n starts at position n * compress_ratio.
+        self.block_rope = nn.RoPE(
+            rotary_dim, base=args.rope_theta, scale=self.compress_ratio
+        )
 
-    def __call__(self, x, rope, cache, offset, left_padding=None) -> Optional[mx.array]:
+    def __call__(self, x, cache, offset, left_padding=None) -> Optional[mx.array]:
         B, S, _ = x.shape
         qk = self.index_qk_proj(x)
         split = self.n_heads * self.head_dim
@@ -273,18 +253,15 @@ class QSAIndexer(nn.Module):
 
         # Block n holds the logical positions n * compress_ratio and up in every
         # row, so the padding does not move the block rope.
-        block_starts = mx.arange(n_blocks) * self.compress_ratio
-        cos_k, sin_k = rope(block_starts[None, :])
-        pooled = _rope_partial(pooled, cos_k, sin_k)
+        pooled = self.block_rope(pooled)
 
         q_pos = _positions(offset, S)
-        cos_q, sin_q = rope(q_pos)
-        q = self.q_layernorm(q)
-        q = _rope_partial(q, cos_q[:, :, None, :], sin_q[:, :, None, :])
+        q = self.q_layernorm(q).transpose(0, 2, 1, 3)
+        q = self.rope(q, offset=offset)
 
         # scores: sum over heads of relu(q.k), per block
         scores = mx.einsum(
-            "bshd,bnd->bsnh", q.astype(mx.float32), pooled.astype(mx.float32)
+            "bhsd,bnd->bsnh", q.astype(mx.float32), pooled.astype(mx.float32)
         )
         scores = mx.maximum(scores, 0).sum(axis=-1) / math.sqrt(self.head_dim)
 
@@ -362,9 +339,12 @@ class Attention(nn.Module):
         self.o_proj = nn.Linear(self.n_heads * self.head_dim, d, bias=False)
         self.q_norm = RMSNorm(self.head_dim, eps=args.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=args.rms_norm_eps)
+        self.rope = nn.RoPE(
+            int(args.head_dim * args.partial_rotary_factor), base=args.rope_theta
+        )
         self.indexer = QSAIndexer(args)
 
-    def __call__(self, x, rope, mask, cache) -> mx.array:
+    def __call__(self, x, mask, cache) -> mx.array:
         B, S, _ = x.shape
         # `cache` holds the attention keys and values, then the indexer keys.
         kv_cache, idx_cache = (
@@ -372,7 +352,7 @@ class Attention(nn.Module):
         )
         offset = kv_cache.offset if kv_cache is not None else 0
 
-        sparse = self.indexer(x, rope, idx_cache, offset, _left_padding(kv_cache))
+        sparse = self.indexer(x, idx_cache, offset, _left_padding(kv_cache))
 
         q, gate = mx.split(self.q_proj(x).reshape(B, S, self.n_heads, -1), 2, axis=-1)
         gate = gate.reshape(B, S, -1)
@@ -382,9 +362,7 @@ class Attention(nn.Module):
         )
         v = self.v_proj(x).reshape(B, S, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
-        cos, sin = rope(_positions(offset, S))
-        cos, sin = cos[:, None], sin[:, None]
-        q, k = _rope_partial(q, cos, sin), _rope_partial(k, cos, sin)
+        q, k = self.rope(q, offset=offset), self.rope(k, offset=offset)
 
         if kv_cache is not None:
             k, v = kv_cache.update_and_fetch(k, v)
@@ -780,7 +758,7 @@ class DecoderLayer(nn.Module):
         self.attn_hyper_connection = GatedResidual(args)
         self.mlp_hyper_connection = GatedResidual(args)
 
-    def __call__(self, h, rope, mask, conv_mask, cache, ids, prev_ctx):
+    def __call__(self, h, mask, conv_mask, cache, ids, prev_ctx):
         if self.ple is not None:
             h = h + self.ple(h, ids, prev_ctx, cache)
 
@@ -788,7 +766,7 @@ class DecoderLayer(nn.Module):
         if self.layer_type == "linear_attention":
             x = self.linear_attn(x, conv_mask, cache)
         else:
-            x = self.self_attn(x, rope, mask, cache)
+            x = self.self_attn(x, mask, cache)
         h = hyper + (x[..., None, :] * inject[..., None]).reshape(*x.shape[:-1], -1)
 
         x, hyper, inject = self.mlp_hyper_connection(h)
@@ -805,8 +783,6 @@ class Qwen4ExpModel(nn.Module):
         self.layers = [DecoderLayer(args, i) for i in range(args.num_hidden_layers)]
         # no final `norm` in this model: this mixer carries it
         self.hyper_connection_mixer = GatedResidual(args, use_combine=False)
-        rotary_dim = int(args.head_dim * args.partial_rotary_factor)
-        self.rope = RotaryEmbedding(rotary_dim, args.rope_theta)
         self.ple_layers = [
             i for i in range(args.num_hidden_layers) if (i + 1) in args.ple_layer_ids
         ]
@@ -856,7 +832,7 @@ class Qwen4ExpModel(nn.Module):
 
         h = mx.tile(h, (1, 1, self.hc))
         for layer, c in zip(self.layers, cache):
-            h = layer(h, self.rope, mask, conv_mask, c, ids, prev_ctx)
+            h = layer(h, mask, conv_mask, c, ids, prev_ctx)
         return self.hyper_connection_mixer(h)
 
 

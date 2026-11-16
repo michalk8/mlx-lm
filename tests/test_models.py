@@ -980,6 +980,14 @@ class TestModels(unittest.TestCase):
             for i, s in enumerate(solo):
                 self.assertTrue(mx.allclose(batched[i : i + 1], s, atol=1e-4))
 
+        # A fresh row merged next to a row with state must match it alone.
+        cached = make_prompt_cache(model)
+        model(rows[1][:, :8], cache=cached)
+        fresh = make_prompt_cache(model)
+        joined = [cs[0].merge(list(cs)) for cs in zip(fresh, cached, strict=True)]
+        out = model(mx.concatenate([rows[0][:, :7], rows[1][:, 8:]]), cache=joined)
+        self.assertTrue(mx.allclose(out[:1], model(rows[0][:, :7]), atol=1e-4))
+
     def test_qwen3_moe(self):
         from mlx_lm.models import qwen3_moe
 

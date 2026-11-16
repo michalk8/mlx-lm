@@ -233,7 +233,7 @@ class QSAIndexer(nn.Module):
         scores = mx.where(visible, scores, -mx.inf)
 
         k = min(self.block_topk, n_blocks)
-        top = mx.argpartition(-scores, k - 1, axis=-1)[..., :k]
+        top = mx.stop_gradient(mx.argpartition(-scores, k - 1, axis=-1)[..., :k])
         picked = mx.take_along_axis(visible, top, axis=-1)
 
         # The tokens of the picked blocks; the others go to a dropped column.
@@ -421,6 +421,7 @@ class SparseMoeBlock(nn.Module):
     def __call__(self, x: mx.array) -> mx.array:
         logits = self.gate(x.astype(mx.float32))
         idx = mx.argpartition(-logits, self.top_k - 1, axis=-1)[..., : self.top_k]
+        idx = mx.stop_gradient(idx)
         # The softmax of the top-k logits: the reference's renormalized top-k.
         w = mx.softmax(mx.take_along_axis(logits, idx, axis=-1), axis=-1)
         out = (self.switch_mlp(x, idx) * w[..., None]).sum(axis=-2).astype(x.dtype)
@@ -503,13 +504,16 @@ class NGramEmbedding(nn.Module):
         return tokens
 
     def __call__(self, ids: mx.array, cache: Any | None = None) -> mx.array:
-        n = self.ngram_size
-        prev = cache[3] if cache is not None else None
-        if prev is None:
-            prev = mx.full((ids.shape[0], n - 1), self.eos_token_id, ids.dtype)
+        n, eos = self.ngram_size, self.eos_token_id
+        # Slot 3 holds `token ^ eos`: XOR with eos again gives the token, and
+        # the zeros that batching puts in a new row read as EOS (no tokens yet).
+        if cache is not None and cache[3] is not None:
+            prev = cache[3] ^ eos
+        else:
+            prev = mx.full((ids.shape[0], n - 1), eos, ids.dtype)
         history = mx.concatenate([prev, ids], axis=1)
         if cache is not None:
-            cache[3] = _keep_last(history, n=n - 1, lengths=cache.lengths)
+            cache[3] = _keep_last(history, n=n - 1, lengths=cache.lengths) ^ eos
 
         tokens = self._ngram_tokens(history.astype(mx.int64))
 

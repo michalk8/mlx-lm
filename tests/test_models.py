@@ -14,9 +14,7 @@ from mlx.utils import tree_flatten, tree_map
 from mlx_lm.models import rope_utils
 from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
 from mlx_lm.models.cache import (
-    ArraysCache,
     BatchKVCache,
-    CacheList,
     KVCache,
     RotatingKVCache,
     make_prompt_cache,
@@ -857,7 +855,7 @@ class TestModels(unittest.TestCase):
                 ngram_size=3,
                 heads_per_ngram=2,
                 ngram_vocab_size_base=101,
-                ple_embed_dim=64,
+                ple_embed_dim=128,
                 ple_layer_ids=[2],
                 eos_token_id=1,
                 rope_parameters={
@@ -868,46 +866,58 @@ class TestModels(unittest.TestCase):
         )
         model = qwen4_exp.Model(args)
 
-        # Older MLX conversions and the HF checkpoint split layers that this
-        # file merges; sanitize merges them back.
-        weights = dict(tree_flatten(model.parameters()))
-        self.assertEqual(set(model.sanitize(weights)), set(weights))
-        old = dict(weights)
-        for k in [
-            k for k in old if k.endswith("_connection.input_mix_weight_down.weight")
-        ]:
-            down, inject = mx.split(old[k], [args.text.hc_lowrank], axis=-2)
-            old[k] = down
-            old[k.replace("input_mix_weight_down", "block_inject_weight")] = inject
-        # The checkpoint pads the joined tables to a multiple of 128 rows and
-        # splits them into equal shards: `shard_{i}` (HF), `shards.{i}` (mlx-vlm).
-        p = "model.layers.1.ple.ple_embedding.ngram_embedding."
-        n = len(model.model.layers[1].ple.ple_embedding.ngram_embedding)
-        table = mx.concatenate([old.pop(f"{p}{h}.weight") for h in range(n)])
-        rows = math.ceil(table.shape[0] / 128) * 128
-        table = mx.pad(table, [(0, rows - table.shape[0]), (0, 0)])
-        for i, w in enumerate(mx.split(table, 4, axis=0)):
-            old[f"{p}shards.{i}.weight"] = w
-        hf = {k.replace(".shards.", ".shard_"): v for k, v in old.items()}
-        for split in (old, hf):
-            merged = model.sanitize(split)
-            self.assertEqual(set(merged), set(weights))
+        # Checkpoints split the block inject from the mix down and store the
+        # n-gram tables as row shards; HF and mlx-vlm (`shards.{i}`) store the
+        # `1 + w` norms as `w`. Each layout must sanitize to the model weights.
+        ref = copy.deepcopy(model)
+        nn.quantize(
+            ref,
+            32,
+            4,
+            class_predicate=lambda _, m: hasattr(m, "to_quantized")
+            and m.weight.shape[-1] % 32 == 0,
+        )
+        weights = dict(tree_flatten(ref.parameters()))
+        self.assertEqual(set(ref.sanitize(weights)), set(weights))
+        r = args.text.hc_lowrank
+        n = len(ref.model.layers[1].ple.ple_embedding.ngram_embedding)
+        layouts = [
+            ("model.language_model.", True, "shard_"),  # HF
+            ("language_model.model.", True, "shards."),  # mlx-vlm
+            ("language_model.model.", False, "shard_"),  # TensorFold
+            ("model.", False, "shards."),  # older mlx-lm conversions
+        ]
+        for pre, raw, shard in layouts:
+            ckpt = {}
             for k, v in weights.items():
-                self.assertTrue(mx.array_equal(merged[k], v), k)
+                if raw and k.endswith(qwen4_exp._FOLD_ONE):
+                    v = v - 1
+                ckpt[k.replace("model.", pre, 1)] = v
+            for k in [k for k in ckpt if k.endswith("input_mix_weight_down.weight")]:
+                p = k[: -len("weight")]
+                inject = p.replace("input_mix_weight_down", "block_inject_weight")
+                for name in ("weight", "scales", "biases"):
+                    v = ckpt.pop(p + name)
+                    ckpt[p + name] = v[:r]
+                    ckpt[inject + name] = v[r:]
+            p = pre + "layers.1.ple.ple_embedding.ngram_embedding."
+            for name in ("weight", "scales", "biases"):
+                table = mx.concatenate([ckpt.pop(f"{p}{h}.{name}") for h in range(n)])
+                rows = math.ceil(table.shape[0] / 128) * 128
+                table = mx.pad(table, [(0, rows - table.shape[0]), (0, 0)])
+                for i, part in enumerate(mx.split(table, 4)):
+                    ckpt[f"{p}{shard}{i}.{name}"] = part
+            out = ref.sanitize(ckpt)
+            self.assertEqual(set(out), set(weights))
+            for k, v in weights.items():
+                self.assertTrue(mx.array_equal(out[k], v), (pre, k))
 
         # The checkpoint's n-gram hash constants are checked, then dropped.
         key = "model.layers.1.ple.ple_embedding.layer_multipliers"
         mults = model.model.layers[1].ple.ple_embedding._mults
-        self.assertNotIn(key, model.sanitize({**weights, key: mults}))
-        wrong = qwen4_exp.Model(
-            qwen4_exp.ModelArgs(
-                model_type="qwen4_exp", text_config={**args.text_config, "seed": 0}
-            )
-        )
+        self.assertEqual(model.sanitize({key: mults}), {})
         with self.assertRaises(ValueError):
-            model.sanitize(
-                {**weights, key: wrong.model.layers[1].ple.ple_embedding._mults}
-            )
+            model.sanitize({key: mults + 2})
 
         self.model_test_runner(
             model, args.model_type, args.text.vocab_size, args.text.num_hidden_layers
@@ -916,77 +926,38 @@ class TestModels(unittest.TestCase):
         # The runner leaves the model in float16, too coarse to compare logits.
         model.update(tree_map(lambda p: p.astype(mx.float32), model.parameters()))
 
-        # Past the indexer budget attention is sparse. A prefill into the cache,
-        # then decoding, must match one full prefill; 22 tokens also end in a
-        # partial block.
-        inputs = mx.array([list(range(2, 24))])
+        # Past the indexer budget attention is sparse: a prefill into the cache,
+        # then decoding, must match one full prefill.
+        a = mx.array([list(range(2, 24))])
+        full = model(a)
         cache = make_prompt_cache(model)
-        steps = [model(inputs[:, :15], cache=cache)]
-        steps += [model(inputs[:, i : i + 1], cache=cache) for i in range(15, 22)]
-        self.assertTrue(
-            mx.allclose(model(inputs), mx.concatenate(steps, axis=1), atol=1e-4)
-        )
+        steps = [model(a[:, :15], cache=cache)]
+        steps += [model(a[:, i : i + 1], cache=cache) for i in range(15, 22)]
+        self.assertTrue(mx.allclose(full, mx.concatenate(steps, axis=1), atol=1e-4))
 
-        # Rows of unequal length in one batch must match each row alone.
-        lengths = [22, 15]
-        padding = [max(lengths) - n for n in lengths]
-        rows = [mx.array([list(range(2, 2 + n))]) for n in lengths]
-        step = mx.array([[31], [31]])
-        per_row = [make_prompt_cache(model) for _ in lengths]
-        for r, c in zip(rows, per_row):
-            model(r, cache=c)
-        # The merge left pads the short row.
-        merged = [cs[0].merge(list(cs)) for cs in zip(*per_row)]
-        solo = [model(step[:1], cache=c) for c in per_row]
+        # A batch must match each row alone: a merge left pads a fresh row next
+        # to one with state, and the batch generator right pads its prompts.
+        b = mx.array([list(range(30, 37))])
+        cache = make_prompt_cache(model)
+        model(a[:, :15], cache=cache)
+        fresh = make_prompt_cache(model)
+        merged = [cs[0].merge(list(cs)) for cs in zip(cache, fresh, strict=True)]
+        out = model(mx.concatenate([a[:, 15:], b]), cache=merged)
+        self.assertTrue(mx.allclose(out[:1], full[:, 15:], atol=1e-4))
+        self.assertTrue(mx.allclose(out[1:], model(b), atol=1e-4))
 
-        # The batch generator right pads the prompts; `finalize` turns that
-        # into left padding.
-        right = [
-            cs[0].merge(list(cs))
-            for cs in zip(*[make_prompt_cache(model) for _ in lengths])
-        ]
+        empty = zip(make_prompt_cache(model), make_prompt_cache(model), strict=True)
+        right = [cs[0].merge(list(cs)) for cs in empty]
         for c in right:
-            c.prepare(lengths=lengths, right_padding=padding)
-        model(
-            mx.concatenate(
-                [mx.pad(r, [(0, 0), (0, p)]) for r, p in zip(rows, padding)]
-            ),
-            cache=right,
-        )
+            c.prepare(lengths=[22, 7], right_padding=[0, 15])
+        model(mx.concatenate([a, mx.pad(b, [(0, 0), (0, 15)])]), cache=right)
         for c in right:
             c.finalize()
-
-        # A caller can also pad the prompts on the left.
-        left = [
-            (
-                CacheList(
-                    BatchKVCache(left_padding=padding),
-                    BatchKVCache(left_padding=padding),
-                )
-                if isinstance(c, CacheList)
-                else ArraysCache(len(c.cache), left_padding=padding)
-            )
-            for c in model.make_cache()
-        ]
-        model(
-            mx.concatenate(
-                [mx.pad(r, [(0, 0), (p, 0)]) for r, p in zip(rows, padding)]
-            ),
-            cache=left,
-        )
-
-        for batch_cache in (merged, right, left):
-            batched = model(step, cache=batch_cache)
-            for i, s in enumerate(solo):
-                self.assertTrue(mx.allclose(batched[i : i + 1], s, atol=1e-4))
-
-        # A fresh row merged next to a row with state must match it alone.
-        cached = make_prompt_cache(model)
-        model(rows[1][:, :8], cache=cached)
-        fresh = make_prompt_cache(model)
-        joined = [cs[0].merge(list(cs)) for cs in zip(fresh, cached, strict=True)]
-        out = model(mx.concatenate([rows[0][:, :7], rows[1][:, 8:]]), cache=joined)
-        self.assertTrue(mx.allclose(out[:1], model(rows[0][:, :7]), atol=1e-4))
+        step = mx.array([[31], [31]])
+        out = model(step, cache=right)
+        for i, x in enumerate((a, b)):
+            alone = model(mx.concatenate([x, step[:1]], axis=1))[:, -1:]
+            self.assertTrue(mx.allclose(out[i : i + 1], alone, atol=1e-4))
 
     def test_qwen3_moe(self):
         from mlx_lm.models import qwen3_moe

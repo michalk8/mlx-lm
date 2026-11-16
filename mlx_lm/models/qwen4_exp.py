@@ -713,8 +713,14 @@ class Model(nn.Module):
         return caches
 
     def sanitize(self, weights: dict[str, mx.array]) -> dict[str, mx.array]:
-        # Fold the norms' `1 +` into the weight once: converted checkpoints have it.
-        fold = any(k.startswith("model.language_model.") for k in weights)
+        # HF and mlx-vlm store these norms as `w` for a `1 + w` scale; mlx-vlm is
+        # the flat layout with `shards.{i}` n-gram names. Other flat exports and
+        # mlx-lm conversions already hold `1 + w`.
+        fold = any(
+            k.startswith("model.language_model.")
+            or (k.startswith("language_model.") and ".ngram_embedding.shards." in k)
+            for k in weights
+        )
 
         out = {}
         for k, v in weights.items():
@@ -769,11 +775,14 @@ class Model(nn.Module):
         for k in [k for k in out if k.endswith("ngram_embedding.shards.0.weight")]:
             p = k[: -len("shards.0.weight")]
             n = sum(q.startswith(p + "shards.") and q.endswith(".weight") for q in out)
-            shards = [out.pop(f"{p}shards.{i}.weight") for i in range(n)]
             layer = int(k.split(".layers.")[1].split(".")[0])
             sizes = self.model.layers[layer].ple.ple_embedding.head_vocab_sizes
-            for h, table in enumerate(_split_rows(shards, sizes)):
-                out[f"{p}{h}.weight"] = table
+            # A quantized table splits its scales and biases by the same rows.
+            for name in ("weight", "scales", "biases"):
+                if f"{p}shards.0.{name}" in out:
+                    shards = [out.pop(f"{p}shards.{i}.{name}") for i in range(n)]
+                    for h, table in enumerate(_split_rows(shards, sizes)):
+                        out[f"{p}{h}.{name}"] = table
 
         return out
 

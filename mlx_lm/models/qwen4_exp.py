@@ -581,7 +581,6 @@ class NGramEmbedding(nn.Module):
         prev = cache[3] if cache is not None else None
         if prev is None:
             prev = mx.full((ids.shape[0], n - 1), self.eos_token_id, ids.dtype)
-        # Right padded prompts work; left padded ones do not.
         history = mx.concatenate([prev, ids], axis=1)
         if cache is not None:
             cache[3] = _keep_last(history, n - 1, cache.lengths)
@@ -640,7 +639,10 @@ class PLELayer(nn.Module):
             cache[2] = _keep_last(full, n, cache.lengths)
         return nn.silu(self.conv1d(full[:, -(n + S) :, :]))
 
-    def __call__(self, hidden: mx.array, ids: mx.array, cache) -> mx.array:
+    def __call__(self, hidden: mx.array, ids: mx.array, cache, mask=None) -> mx.array:
+        if mask is not None:
+            # Padding reads as EOS, like the start of a prompt.
+            ids = mx.where(mask, ids, self.ple_embedding.eos_token_id)
         emb = self.ple_embedding(ids, cache).astype(hidden.dtype)
         key = self.norm_key(self.key_proj(emb))
         key = key.reshape(*key.shape[:-1], self.hc, self.d)
@@ -652,6 +654,8 @@ class PLELayer(nn.Module):
         gate = mx.sqrt(mx.maximum(mx.abs(gate), 1e-6)) * mx.sign(gate)
         gated = mx.sigmoid(gate) * value[..., None, :]
         gated = gated.reshape(*gated.shape[:-2], -1)
+        if mask is not None:
+            gated = mx.where(mask[..., None], gated, 0)
         return gated + self._short_conv(self.norm_conv(gated), cache)
 
 
@@ -675,7 +679,7 @@ class DecoderLayer(nn.Module):
 
     def __call__(self, h, mask, conv_mask, cache, ids):
         if self.ple is not None:
-            h = h + self.ple(h, ids, cache)
+            h = h + self.ple(h, ids, cache, conv_mask)
 
         x, hyper, inject = self.attn_hyper_connection(h)
         if self.layer_type == "linear_attention":
@@ -717,7 +721,7 @@ class Qwen4ExpModel(nn.Module):
         mask = create_attention_mask(
             h, attn_cache[0] if attn_cache is not None else None
         )
-        # The deltanet reads in order, so it needs the left padding zeroed out.
+        # The deltanet and PLE read in order, so they need the padding zeroed out.
         conv_mask = create_ssm_mask(h, cache[lin_idx[0]]) if lin_idx else None
 
         h = mx.tile(h, (1, 1, self.hc))

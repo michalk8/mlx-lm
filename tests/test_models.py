@@ -857,7 +857,6 @@ class TestModels(unittest.TestCase):
             ngram_size=3,
             heads_per_ngram=2,
             ngram_vocab_size_base=101,
-            split_ngram_parts=4,
             ple_embed_dim=64,
             ple_layer_ids=[2],
             eos_token_id=1,
@@ -921,7 +920,6 @@ class TestModels(unittest.TestCase):
                 ngram_size=3,
                 heads_per_ngram=2,
                 ngram_vocab_size_base=101,
-                split_ngram_parts=4,
                 ple_embed_dim=64,
                 ple_layer_ids=[2],
                 eos_token_id=1,
@@ -944,10 +942,15 @@ class TestModels(unittest.TestCase):
             down, inject = mx.split(old[k], [args.text.hc_lowrank], axis=-2)
             old[k] = down
             old[k.replace("input_mix_weight_down", "block_inject_weight")] = inject
-        # The n-gram shards come as `shard_{i}` (HF) or `shards.{i}` (mlx-vlm).
-        for k in [k for k in old if k.endswith("ngram_embedding.weight")]:
-            for i, w in enumerate(mx.split(old.pop(k), 4, axis=0)):
-                old[k.replace(".weight", f".shards.{i}.weight")] = w
+        # The checkpoint pads the joined tables to a multiple of 128 rows and
+        # splits them into equal shards: `shard_{i}` (HF), `shards.{i}` (mlx-vlm).
+        p = "model.layers.1.ple.ple_embedding.ngram_embedding."
+        n = len(model.model.layers[1].ple.ple_embedding.ngram_embedding)
+        table = mx.concatenate([old.pop(f"{p}{h}.weight") for h in range(n)])
+        rows = math.ceil(table.shape[0] / 128) * 128
+        table = mx.pad(table, [(0, rows - table.shape[0]), (0, 0)])
+        for i, w in enumerate(mx.split(table, 4, axis=0)):
+            old[f"{p}shards.{i}.weight"] = w
         hf = {k.replace(".shards.", ".shard_"): v for k, v in old.items()}
         for split in (old, hf):
             merged = model.sanitize(split)

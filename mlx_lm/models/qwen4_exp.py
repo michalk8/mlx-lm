@@ -62,8 +62,6 @@ class TextArgs(BaseModelArgs):
     ngram_size: int = 3
     heads_per_ngram: int = 8
     ngram_vocab_size_base: int = 20_000_000
-    make_ngram_vocab_size_divisible_by: int = 128
-    split_ngram_parts: int = 128
     ple_embed_dim: int = 2560
     ple_layer_ids: list = field(default_factory=lambda: [2])
     ple_conv_kernel_size: int = 4
@@ -173,6 +171,17 @@ def _left_padding(cache) -> Optional[mx.array]:
     if pad is None or pad.max().item() == 0:
         return None
     return pad
+
+
+def _keep_last(x: mx.array, n: int, lengths: Optional[mx.array]) -> mx.array:
+    """The last `n` steps of `x`; a right padded row ends at its length."""
+    if lengths is None:
+        # A copy: a slice would keep all of `x` alive in the cache.
+        return mx.contiguous(x[:, -n:])
+    positions = mx.clip(lengths, 0, x.shape[1] - n)[:, None] + mx.arange(n)
+    if x.ndim == 3:
+        positions = positions[..., None]
+    return mx.take_along_axis(x, positions, axis=1)
 
 
 # ------------------------------------------------------------------------ QSA
@@ -442,14 +451,7 @@ class GatedDeltaNet(nn.Module):
             mixed_qkv = mx.where(mask[..., None], mixed_qkv, 0)
         conv_input = mx.concatenate([conv_state, mixed_qkv], axis=1)
         if cache is not None:
-            n_keep = self.conv_kernel_size - 1
-            if cache.lengths is not None:
-                # A right padded batch ends each row at its own length.
-                ends = mx.clip(cache.lengths, 0, S)
-                positions = (ends[:, None] + mx.arange(n_keep))[..., None]
-                cache[0] = mx.take_along_axis(conv_input, positions, axis=1)
-            else:
-                cache[0] = mx.contiguous(conv_input[:, -n_keep:, :])
+            cache[0] = _keep_last(conv_input, self.conv_kernel_size - 1, cache.lengths)
         conv_out = nn.silu(self.conv1d(conv_input))
 
         q, k, v = mx.split(conv_out, [self.key_dim, 2 * self.key_dim], axis=-1)
@@ -578,11 +580,7 @@ def _nth_prime_after(start: int, count: int) -> int:
 
 
 class NGramEmbedding(nn.Module):
-    """N-gram hash table, ~51B parameters.
-
-    The checkpoint splits it into `split_ngram_parts` shards and `sanitize`
-    joins them, so a lookup is one gather on the GPU, with no host sync.
-    """
+    """N-gram hash tables, one per head (~51B parameters)."""
 
     def __init__(self, args: TextArgs, embed_dim: int, ple_layer_index: int = 0):
         super().__init__()
@@ -605,14 +603,8 @@ class NGramEmbedding(nn.Module):
             offsets.append(total)
             total += s
         self.head_vocab_sizes = sizes
-
-        div = args.make_ngram_vocab_size_divisible_by
-        padded = math.ceil(total / div) * div
-        self.n_shards = args.split_ngram_parts
-        self.rows_per_shard = math.ceil(padded / self.n_shards)
-        self.ngram_embedding = nn.Embedding(
-            self.n_shards * self.rows_per_shard, head_dim
-        )
+        # One table per head keeps each checkpoint file small (~6 GB in bf16).
+        self.ngram_embedding = [nn.Embedding(s, head_dim) for s in sizes]
 
         # buffers taken as-is from the checkpoint
         mults = []
@@ -636,42 +628,40 @@ class NGramEmbedding(nn.Module):
         self._sizes = mx.array(sizes, dtype=mx.int64)
         self._offsets = mx.array(offsets, dtype=mx.int64)
 
-    def _shift_right(self, ids: mx.array, shift: int) -> mx.array:
-        """Shift right by `shift`, without crossing an EOS boundary."""
-        if shift == 0:
-            return ids
-        B, T = ids.shape
-        pos = mx.arange(T)
-        eos_pos = mx.where(ids == self.eos_token_id, pos, -1)
-        prev_incl = mx.cummax(eos_pos, axis=1)
-        prev = mx.concatenate(
-            [mx.full((B, 1), -1, dtype=prev_incl.dtype), prev_incl[:, :-1]], axis=1
+    def _ngram_tokens(self, history: mx.array) -> list:
+        """x[t], x[t-1], ... for the new tokens; `history` starts with the n-1
+        tokens before them. Older tokens past an EOS read as EOS."""
+        n, eos = self.ngram_size, self.eos_token_id
+        new = history.shape[1] - (n - 1)
+        # HF's `_shift_right_ignore_eos`, at the new positions only.
+        tokens = [history[:, n - 1 :], history[:, n - 2 : n - 2 + new]]
+        for s in range(2, n):
+            older = history[:, n - 1 - s : n - 1 - s + new]
+            tokens.append(mx.where(tokens[-1] == eos, eos, older))
+        return tokens
+
+    def __call__(self, ids: mx.array, cache) -> mx.array:
+        n = self.ngram_size
+        prev = cache[3] if cache is not None else None
+        if prev is None:
+            prev = mx.full((ids.shape[0], n - 1), self.eos_token_id, ids.dtype)
+        # Right padded prompts work; left padded ones do not.
+        history = mx.concatenate([prev, ids], axis=1)
+        if cache is not None:
+            cache[3] = _keep_last(history, n - 1, cache.lengths)
+        tokens = self._ngram_tokens(history.astype(mx.int64))
+
+        # Step s gives the hash of the (s+1)-gram.
+        mixed, rows = tokens[0] * self._mults[0], []
+        for s in range(1, n):
+            mixed = mx.bitwise_xor(mixed, tokens[s] * self._mults[s])
+            lo = (s - 1) * self.heads_per_ngram
+            rows.append(mixed[..., None] % self._sizes[lo : lo + self.heads_per_ngram])
+        rows = mx.concatenate(rows, axis=-1)
+        return mx.concatenate(
+            [table(rows[..., h]) for h, table in enumerate(self.ngram_embedding)],
+            axis=-1,
         )
-        in_segment = pos[None] - (prev + 1)
-        src = pos - shift
-        gathered = mx.take_along_axis(
-            ids, mx.broadcast_to(mx.maximum(src, 0)[None], (B, T)), axis=1
-        )
-        ok = (in_segment >= shift) & (src[None] >= 0)
-        return mx.where(ok, gathered, self.eos_token_id)
-
-    def __call__(self, ids: mx.array, prev_context: mx.array) -> mx.array:
-        n_new = ids.shape[1]
-        history = mx.concatenate([prev_context, ids], axis=1).astype(mx.int64)
-        shifted = [self._shift_right(history, s) for s in range(self.ngram_size)]
-
-        blocks = []
-        for ngram in range(2, self.ngram_size + 1):
-            lo = (ngram - 2) * self.heads_per_ngram
-            hi = lo + self.heads_per_ngram
-            mixed = shifted[0] * self._mults[0]
-            for p in range(1, ngram):
-                mixed = mx.bitwise_xor(mixed, shifted[p] * self._mults[p])
-            gid = mixed[..., None] % self._sizes[lo:hi].reshape(1, 1, -1)
-            blocks.append(gid + self._offsets[lo:hi].reshape(1, 1, -1))
-
-        gid = mx.concatenate(blocks, axis=-1)[:, -n_new:]
-        return self.ngram_embedding(gid).reshape(*gid.shape[:2], -1)
 
 
 _NGRAM_SHARD_RE = re.compile(r"\.ngram_embedding\.shard_(\d+)\.")
@@ -711,19 +701,11 @@ class PLELayer(nn.Module):
         )
         full = mx.concatenate([state, x], axis=1)
         if cache is not None:
-            if cache.lengths is not None:
-                # A right padded batch ends each row at its own length.
-                ends = mx.clip(cache.lengths, 0, S)
-                positions = (ends[:, None] + mx.arange(n))[..., None]
-                cache[2] = mx.take_along_axis(full, positions, axis=1)
-            else:
-                cache[2] = mx.contiguous(full[:, -n:, :])
+            cache[2] = _keep_last(full, n, cache.lengths)
         return nn.silu(self.conv1d(full[:, -(n + S) :, :]))
 
-    def __call__(
-        self, hidden: mx.array, ids: mx.array, prev_ctx: mx.array, cache
-    ) -> mx.array:
-        emb = self.ple_embedding(ids, prev_ctx).astype(hidden.dtype)
+    def __call__(self, hidden: mx.array, ids: mx.array, cache) -> mx.array:
+        emb = self.ple_embedding(ids, cache).astype(hidden.dtype)
         key = self.norm_key(self.key_proj(emb))
         key = key.reshape(*key.shape[:-1], self.hc, self.d)
         value = self.value_proj(emb)
@@ -758,9 +740,9 @@ class DecoderLayer(nn.Module):
         self.attn_hyper_connection = GatedResidual(args)
         self.mlp_hyper_connection = GatedResidual(args)
 
-    def __call__(self, h, mask, conv_mask, cache, ids, prev_ctx):
+    def __call__(self, h, mask, conv_mask, cache, ids):
         if self.ple is not None:
-            h = h + self.ple(h, ids, prev_ctx, cache)
+            h = h + self.ple(h, ids, cache)
 
         x, hyper, inject = self.attn_hyper_connection(h)
         if self.layer_type == "linear_attention":
@@ -806,33 +788,9 @@ class Qwen4ExpModel(nn.Module):
         # zeroed out. Its cache holds the padding, one value per row.
         conv_mask = create_ssm_mask(h, cache[lin_idx[0]]) if lin_idx else None
 
-        prev_ctx = None
-        # The n-gram hash reads `ids` in order, so it holds for the right padded
-        # prompt of a batch, but not for one that is already left padded.
-        if self.ple_layers:
-            ctx_len = self.args.ngram_size - 1
-            eos = self.args.eos_token_id
-            eos = eos[0] if isinstance(eos, list) else eos
-            pc = cache[self.ple_layers[0]]
-            prev = pc[3] if pc is not None else None
-            prev_ctx = (
-                prev
-                if prev is not None
-                else mx.full((ids.shape[0], ctx_len), eos, ids.dtype)
-            )
-            if pc is not None:
-                history = mx.concatenate([prev_ctx, ids], axis=1)
-                if pc.lengths is not None:
-                    ends = mx.clip(pc.lengths, 0, ids.shape[1])
-                    pc[3] = mx.take_along_axis(
-                        history, ends[:, None] + mx.arange(ctx_len), axis=1
-                    )
-                else:
-                    pc[3] = history[:, -ctx_len:]
-
         h = mx.tile(h, (1, 1, self.hc))
         for layer, c in zip(self.layers, cache):
-            h = layer(h, mask, conv_mask, c, ids, prev_ctx)
+            h = layer(h, mask, conv_mask, c, ids)
         return self.hyper_connection_mixer(h)
 
 
@@ -845,6 +803,22 @@ def _merge_linears(weights: dict, parts: list, target: str):
             weights[f"{target}.{name}"] = mx.concatenate(
                 [weights.pop(k) for k in keys], axis=-2
             )
+
+
+def _split_rows(shards: list, sizes: list) -> list:
+    """Split a table stored as equal row shards into tables of `sizes` rows."""
+    rows = shards[0].shape[0]
+    tables, start = [], 0
+    for size in sizes:
+        end = start + size
+        first, last = start // rows, (end - 1) // rows
+        pieces = [
+            s[max(start - i * rows, 0) : min(end - i * rows, rows)]
+            for i, s in enumerate(shards[first : last + 1], first)
+        ]
+        tables.append(mx.concatenate(pieces))
+        start = end
+    return tables
 
 
 class Model(nn.Module):
@@ -959,11 +933,15 @@ class Model(nn.Module):
             p = k[: -len("block_inject_weight.weight")]
             down = p + "input_mix_weight_down"
             _merge_linears(out, [down, p + "block_inject_weight"], down)
-        # The n-gram table: the checkpoint's shards, in order.
+        # The checkpoint has equal row shards; the model keeps one table per head.
         for k in [k for k in out if k.endswith("ngram_embedding.shards.0.weight")]:
-            p = k[: -len("0.weight")]
-            n = sum(q.startswith(p) and q.endswith(".weight") for q in out)
-            _merge_linears(out, [f"{p}{i}" for i in range(n)], p[: -len(".shards.")])
+            p = k[: -len("shards.0.weight")]
+            n = sum(q.startswith(p + "shards.") and q.endswith(".weight") for q in out)
+            shards = [out.pop(f"{p}shards.{i}.weight") for i in range(n)]
+            layer = int(k.split(".layers.")[1].split(".")[0])
+            sizes = self.model.layers[layer].ple.ple_embedding.head_vocab_sizes
+            for h, table in enumerate(_split_rows(shards, sizes)):
+                out[f"{p}{h}.weight"] = table
         return out
 
     _NGRAM_CONSTANTS = (

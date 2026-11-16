@@ -133,8 +133,6 @@ class RMSNorm(nn.Module):
         self.weight = mx.ones(dim)
         self.eps = eps
         self.group_size = group_size
-        if group_size is not None and dim % group_size:
-            raise ValueError(f"dim {dim} is not divisible by group_size {group_size}")
 
     def __call__(self, x: mx.array) -> mx.array:
         if self.group_size is None:
@@ -148,17 +146,16 @@ class RMSNorm(nn.Module):
 class RMSNormGated(nn.Module):
     """Gated RMSNorm; the checkpoint stores `weight` as is."""
 
-    def __init__(self, dim: int, *, eps: float = 1e-6, activation: str = "sigmoid"):
+    def __init__(self, dim: int, *, activation: str, eps: float = 1e-6):
         super().__init__()
         self.weight = mx.ones(dim)
         self.eps = eps
         self.activation = activation
 
     def __call__(self, x: mx.array, gate: mx.array) -> mx.array:
-        out = mx.fast.rms_norm(x, self.weight, eps=self.eps)
         act = mx.sigmoid if self.activation == "sigmoid" else nn.silu
-        g = act(gate.astype(mx.float32))
-        return (g * out.astype(mx.float32)).astype(x.dtype)
+        out = mx.fast.rms_norm(x, self.weight, eps=self.eps)
+        return (out * act(gate.astype(mx.float32))).astype(x.dtype)
 
 
 class QSAIndexer(nn.Module):
@@ -167,13 +164,14 @@ class QSAIndexer(nn.Module):
     def __init__(self, args: TextArgs):
         super().__init__()
         self.n_heads = args.indexer_n_heads
-        self.kv_heads = args.indexer_kv_heads
         self.head_dim = args.indexer_head_dim
         self.token_budget = args.indexer_budget
         self.compress_ratio = args.indexer_compress_ratio
         self.block_topk = self.token_budget // self.compress_ratio
         self.index_qk_proj = nn.Linear(
-            args.hidden_size, (self.n_heads + self.kv_heads) * self.head_dim, bias=False
+            args.hidden_size,
+            (self.n_heads + args.indexer_kv_heads) * self.head_dim,
+            bias=False,
         )
         self.q_layernorm = RMSNorm(self.head_dim, eps=args.rms_norm_eps)
         self.k_layernorm = RMSNorm(self.head_dim, eps=args.rms_norm_eps)
@@ -190,11 +188,11 @@ class QSAIndexer(nn.Module):
         qk = self.index_qk_proj(x)
         split = self.n_heads * self.head_dim
         q = qk[..., :split].reshape(B, S, self.n_heads, self.head_dim)
+        # One key head: the reference requires `indexer_kv_heads` to be 1.
         raw_k = qk[..., split:].reshape(B, S, self.head_dim)
 
         offset = cache.offset if cache is not None else 0
-        # A batched cache's left padding: each row's blocks start at its first
-        # real token (Blaizzy/mlx-vlm#2028).
+        # With left padding, each row's blocks start at its first real token.
         pad = getattr(cache, "left_padding", None)
         if cache is not None:
             raw_k, _ = cache.update_and_fetch(raw_k[:, None], raw_k[:, None])
@@ -213,8 +211,8 @@ class QSAIndexer(nn.Module):
             blocks = raw_k[:, : n_blocks * r]
         else:
             # A block that runs past the buffer is never visible.
-            cols = mx.minimum(pad[:, None] + mx.arange(n_blocks * r), kv_len - 1)
-            blocks = mx.take_along_axis(raw_k, cols[..., None], axis=1)
+            pos = mx.minimum(pad[:, None] + mx.arange(n_blocks * r), kv_len - 1)
+            blocks = mx.take_along_axis(raw_k, pos[..., None], axis=1)
         pooled = blocks.reshape(B, n_blocks, r, self.head_dim)
         pooled = pooled.astype(mx.float32).mean(axis=2).astype(raw_k.dtype)
         pooled = self.block_rope(self.k_layernorm(pooled))
@@ -244,8 +242,7 @@ class QSAIndexer(nn.Module):
         keep = mx.zeros((B, S, kv_len + 1), dtype=mx.bool_)
         keep = mx.put_along_axis(keep, tok, mx.array(True), axis=-1)[..., :kv_len]
 
-        # Keep each query's own partial block: an all-masked row would attend to
-        # every key, future ones included.
+        # The reference also keeps each query's own partial block (its `tail`).
         own_start = n_complete * r + pad[:, None]
         cols = mx.arange(kv_len)
         q_cols = mx.arange(kv_len - S, kv_len)[:, None]
@@ -286,8 +283,6 @@ class Attention(nn.Module):
         )
         offset = kv_cache.offset if kv_cache is not None else 0
 
-        sparse = self.indexer(x, idx_cache)
-
         q, gate = mx.split(self.q_proj(x).reshape(B, S, self.n_heads, -1), 2, axis=-1)
         gate = gate.reshape(B, S, -1)
         q = self.q_norm(q).transpose(0, 2, 1, 3)
@@ -301,8 +296,10 @@ class Attention(nn.Module):
         if kv_cache is not None:
             k, v = kv_cache.update_and_fetch(k, v)
 
+        # Past the budget, the sparse mask replaces `mask`: it is causal and
+        # free of padding.
+        sparse = self.indexer(x, idx_cache)
         if sparse is not None:
-            # Causal and free of padding by construction: it replaces the mask.
             mask = sparse
 
         out = scaled_dot_product_attention(
@@ -333,7 +330,7 @@ class GatedDeltaNet(nn.Module):
             groups=self.conv_dim,
             padding=0,
         )
-        # unlike qwen3-next, the projections are split
+        # Unlike qwen3_next, the projections are split.
         self.in_proj_qkv = nn.Linear(d, self.conv_dim, bias=False)
         self.in_proj_z = nn.Linear(d, self.value_dim, bias=False)
         self.in_proj_b = nn.Linear(d, self.n_v, bias=False)
@@ -341,7 +338,7 @@ class GatedDeltaNet(nn.Module):
         self.dt_bias = mx.ones(self.n_v)
         self.A_log = mx.zeros(self.n_v)
         self.norm = RMSNormGated(
-            self.dv, eps=args.rms_norm_eps, activation=args.output_gate_type
+            self.dv, activation=args.output_gate_type, eps=args.rms_norm_eps
         )
         self.out_proj = nn.Linear(self.value_dim, d, bias=False)
 
@@ -424,7 +421,8 @@ class SparseMoeBlock(nn.Module):
     def __call__(self, x: mx.array) -> mx.array:
         logits = self.gate(x.astype(mx.float32))
         idx = mx.argpartition(-logits, self.top_k - 1, axis=-1)[..., : self.top_k]
-        w = mx.softmax(mx.take_along_axis(logits, idx, axis=-1), axis=-1, precise=True)
+        # The softmax of the top-k logits: the reference's renormalized top-k.
+        w = mx.softmax(mx.take_along_axis(logits, idx, axis=-1), axis=-1)
         out = (self.switch_mlp(x, idx) * w[..., None]).sum(axis=-2).astype(x.dtype)
         return out + mx.sigmoid(self.shared_expert_gate(x)) * self.shared_expert(x)
 
@@ -443,9 +441,7 @@ class GatedResidual(nn.Module):
         self.input_mix_weight_down = nn.Linear(hc_dim, down, bias=False)
         self.input_mix_weight_up = nn.Linear(self.lowrank, hc_dim, bias=False)
 
-    def __call__(
-        self, hyper: mx.array
-    ) -> mx.array | tuple[mx.array, mx.array, mx.array]:
+    def __call__(self, hyper: mx.array) -> mx.array | tuple[mx.array, mx.array]:
         normed = self.hc_norm(hyper)
         down = self.input_mix_weight_down(normed)
         w = nn.silu(down[..., : self.lowrank] / self.hc)
@@ -455,7 +451,7 @@ class GatedResidual(nn.Module):
         if not self.use_combine:
             return mixed
         inject = 2 * mx.sigmoid(down[..., self.lowrank :] / self.hc)
-        return mixed, hyper, inject
+        return mixed, inject
 
 
 class NGramEmbedding(nn.Module):
@@ -484,14 +480,11 @@ class NGramEmbedding(nn.Module):
         # One table per head keeps each checkpoint file small (~6 GB in bf16).
         self.ngram_embedding = [nn.Embedding(s, head_dim) for s in sizes]
 
-        mults = []
-        max_long = (1 << 63) - 1
-        half = max(1, (max_long // max(args.vocab_size, 1)) // 2)
-        base_seed = args.seed + _PRIME_1 * ple_layer_index
-        for i in range(self.ngram_size):
-            mults.append(
-                2 * (_splitmix64((base_seed + _GAMMA * (i + 1)) & _MASK64) % half) + 1
-            )
+        mults = _ngram_multipliers(
+            vocab_size=args.vocab_size,
+            ngram_size=self.ngram_size,
+            seed=args.seed + _PRIME_1 * ple_layer_index,
+        )
         # Not parameters: rebuilt from the config, checked in `sanitize`.
         self._mults = mx.array(mults, dtype=mx.int64)
         self._sizes = mx.array(sizes, dtype=mx.int64)
@@ -521,7 +514,8 @@ class NGramEmbedding(nn.Module):
         tokens = self._ngram_tokens(history.astype(mx.int64))
 
         # Step s gives the hash of the (s+1)-gram.
-        mixed, rows = tokens[0] * self._mults[0], []
+        mixed = tokens[0] * self._mults[0]
+        rows = []
         for s in range(1, n):
             mixed = mx.bitwise_xor(mixed, tokens[s] * self._mults[s])
             lo = (s - 1) * self.heads_per_ngram
@@ -542,8 +536,8 @@ class PLELayer(nn.Module):
         hc_dim = self.d * self.hc
         self.ple_embedding = NGramEmbedding(args, ple_layer_index=ple_layer_index)
         k = args.ple_conv_kernel_size
-        self.dilation = args.ngram_size
-        self.short_conv_state_len = (k - 1) * self.dilation
+        dilation = args.ngram_size
+        self.short_conv_state_len = (k - 1) * dilation
         self.key_proj = nn.Linear(args.ple_embed_dim, hc_dim, bias=False)
         self.value_proj = nn.Linear(args.ple_embed_dim, self.d, bias=False)
         self.norm_key = RMSNorm(hc_dim, group_size=self.d, eps=args.rms_norm_eps)
@@ -554,12 +548,11 @@ class PLELayer(nn.Module):
             hc_dim,
             kernel_size=k,
             groups=hc_dim,
-            dilation=self.dilation,
+            dilation=dilation,
             bias=False,
         )
 
     def _short_conv(self, x: mx.array, cache: Any | None) -> mx.array:
-        S = x.shape[1]
         n = self.short_conv_state_len
         state = (
             cache[2]
@@ -569,7 +562,7 @@ class PLELayer(nn.Module):
         full = mx.concatenate([state, x], axis=1)
         if cache is not None:
             cache[2] = _keep_last(full, n=n, lengths=cache.lengths)
-        return nn.silu(self.conv1d(full[:, -(n + S) :, :]))
+        return nn.silu(self.conv1d(full))
 
     def __call__(
         self,
@@ -609,14 +602,12 @@ class DecoderLayer(nn.Module):
         else:
             self.self_attn = Attention(args)
         self.mlp = SparseMoeBlock(args)
-        ple_idx = (
-            args.ple_layer_ids.index(layer_idx + 1)
-            if (layer_idx + 1) in args.ple_layer_ids
-            else None
-        )
-        self.ple = (
-            PLELayer(args, ple_layer_index=ple_idx) if ple_idx is not None else None
-        )
+        # `ple_layer_ids` counts layers from 1.
+        if layer_idx + 1 in args.ple_layer_ids:
+            ple_index = args.ple_layer_ids.index(layer_idx + 1)
+            self.ple = PLELayer(args, ple_layer_index=ple_index)
+        else:
+            self.ple = None
         self.attn_hyper_connection = GatedResidual(args)
         self.mlp_hyper_connection = GatedResidual(args)
 
@@ -632,33 +623,29 @@ class DecoderLayer(nn.Module):
         if self.ple is not None:
             h = h + self.ple(h, ids, cache, mask=conv_mask)
 
-        x, hyper, inject = self.attn_hyper_connection(h)
+        x, inject = self.attn_hyper_connection(h)
         if self.layer_type == "linear_attention":
             x = self.linear_attn(x, conv_mask, cache)
         else:
             x = self.self_attn(x, mask, cache)
-        h = _inject(hyper, x, inject)
+        h = _inject(h, x, inject)
 
-        x, hyper, inject = self.mlp_hyper_connection(h)
-        return _inject(hyper, self.mlp(x), inject)
+        x, inject = self.mlp_hyper_connection(h)
+        return _inject(h, self.mlp(x), inject)
 
 
 class Qwen4ExpModel(nn.Module):
     def __init__(self, args: TextArgs):
         super().__init__()
-        self.args = args
         self.hc = args.hc_count
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
             DecoderLayer(args, layer_idx=i) for i in range(args.num_hidden_layers)
         ]
-        # no final `norm` in this model: this mixer carries it
+        # No final norm: the mixer normalizes the streams before it merges them.
         self.hyper_connection_mixer = GatedResidual(args, use_combine=False)
         self.first_attention = args.layer_types.index("full_attention")
         self.first_linear = args.layer_types.index("linear_attention")
-        self.ple_layers = [
-            i for i in range(args.num_hidden_layers) if (i + 1) in args.ple_layer_ids
-        ]
 
     def __call__(
         self,
@@ -679,7 +666,7 @@ class Qwen4ExpModel(nn.Module):
         conv_mask = create_ssm_mask(h, cache=cache[self.first_linear])
 
         h = mx.tile(h, (1, 1, self.hc))
-        for layer, c in zip(self.layers, cache):
+        for layer, c in zip(self.layers, cache, strict=True):
             h = layer(h, mask=mask, conv_mask=conv_mask, cache=c, ids=ids)
         return self.hyper_connection_mixer(h)
 
@@ -712,14 +699,13 @@ class Model(nn.Module):
 
     def make_cache(self) -> list[Any]:
         caches = []
-        for i, t in enumerate(self.args.text.layer_types):
-            if t == "full_attention":
+        for layer in self.layers:
+            if layer.layer_type == "full_attention":
                 caches.append(CacheList(KVCache(), KVCache()))
             else:
                 # The deltanet conv and recurrent state; a PLE layer adds its
                 # conv state and n-gram context.
-                num_states = 4 if i in self.model.ple_layers else 2
-                caches.append(ArraysCache(num_states))
+                caches.append(ArraysCache(2 if layer.ple is None else 4))
         return caches
 
     def sanitize(self, weights: dict[str, mx.array]) -> dict[str, mx.array]:
@@ -805,7 +791,7 @@ class Model(nn.Module):
     @property
     def quant_predicate(self) -> Callable[[str, nn.Module], bool]:
         def predicate(path: str, _: nn.Module) -> bool:
-            # The MoE router stays in full precision.
+            # The MoE router is not quantized.
             return not path.endswith("mlp.gate")
 
         return predicate
@@ -861,6 +847,15 @@ def _splitmix64(v: int) -> int:
     v = ((v ^ (v >> 30)) * _M1) & _MASK64
     v = ((v ^ (v >> 27)) * _M2) & _MASK64
     return (v ^ (v >> 31)) & _MASK64
+
+
+def _ngram_multipliers(*, vocab_size: int, ngram_size: int, seed: int) -> list[int]:
+    """Odd hash multipliers, small enough that `token * multiplier` fits in int64."""
+    half = max(1, ((1 << 63) - 1) // max(vocab_size, 1) // 2)
+    return [
+        2 * (_splitmix64((seed + _GAMMA * (i + 1)) & _MASK64) % half) + 1
+        for i in range(ngram_size)
+    ]
 
 
 def _is_prime(v: int) -> bool:

@@ -24,7 +24,7 @@ from .cache import ArraysCache, CacheList, KVCache
 from .gated_delta import gated_delta_update, normalize_qk
 from .switch_layers import SwitchGLU
 
-# splitmix64 constants, and the per-layer seed step of the n-gram hash.
+# splitmix64 and n-gram hash constants.
 _MASK64 = (1 << 64) - 1
 _GAMMA = 0x9E3779B97F4A7C15
 _M1, _M2 = 0xBF58476D1CE4E5B9, 0x94D049BB133111EB
@@ -62,34 +62,28 @@ class TextArgs(BaseModelArgs):
     rms_norm_eps: float
     rope_parameters: dict[str, Any]
     eos_token_id: int | list[int]
-    # MoE
     num_experts: int
     num_experts_per_tok: int
     moe_intermediate_size: int
     shared_expert_intermediate_size: int
-    # Gated deltanet
     linear_num_key_heads: int
     linear_num_value_heads: int
     linear_key_head_dim: int
     linear_value_head_dim: int
     linear_conv_kernel_dim: int
-    # Hyper-connections
     hc_count: int
     hc_lowrank: int
-    # QSA
     indexer_n_heads: int
     indexer_kv_heads: int
     indexer_head_dim: int
     indexer_budget: int
     indexer_compress_ratio: int
-    # N-gram embedding (PLE)
     ngram_size: int
     heads_per_ngram: int
     ngram_vocab_size_base: int
     ple_embed_dim: int
     ple_layer_ids: list[int]
-    # Optional, with the reference's defaults. `seed` is not in config.json,
-    # and the n-gram hash depends on it.
+    # Optional, with the reference's defaults. config.json has no `seed` (n-gram hash).
     ple_conv_kernel_size: int = 4
     seed: int = 1234
     layer_types: list[str] = field(default_factory=list)
@@ -125,8 +119,7 @@ class ModelArgs(BaseModelArgs):
 
 
 class RMSNorm(nn.Module):
-    """RMSNorm with one statistic per `group_size` slice, e.g. per stream of the
-    hyper-connections. `sanitize` folds the checkpoint's `1 + w` into `weight`."""
+    """RMSNorm, optionally per `group_size` slice; `weight` holds the folded `1 + w`."""
 
     def __init__(self, dim: int, *, group_size: int | None = None, eps: float = 1e-6):
         super().__init__()
@@ -188,7 +181,7 @@ class QSAIndexer(nn.Module):
         qk = self.index_qk_proj(x)
         split = self.n_heads * self.head_dim
         q = qk[..., :split].reshape(B, S, self.n_heads, self.head_dim)
-        # One key head: the reference requires `indexer_kv_heads` to be 1.
+        # One key head (`indexer_kv_heads` is 1).
         raw_k = qk[..., split:].reshape(B, S, self.head_dim)
 
         offset = cache.offset if cache is not None else 0
@@ -257,7 +250,7 @@ class Attention(nn.Module):
         self.head_dim = args.head_dim
         self.scale = self.head_dim**-0.5
         d = args.hidden_size
-        # q_proj also carries the output gate: n_heads * head_dim * 2
+        # q_proj also carries the output gate.
         self.q_proj = nn.Linear(d, self.n_heads * self.head_dim * 2, bias=False)
         self.k_proj = nn.Linear(d, self.n_kv_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(d, self.n_kv_heads * self.head_dim, bias=False)
@@ -295,8 +288,7 @@ class Attention(nn.Module):
         if kv_cache is not None:
             k, v = kv_cache.update_and_fetch(k, v)
 
-        # Past the budget, the sparse mask replaces `mask`: it is causal and
-        # free of padding.
+        # The sparse mask is causal and has no padding: it replaces `mask`.
         sparse = self.indexer(x, idx_cache)
         if sparse is not None:
             mask = sparse
@@ -329,7 +321,6 @@ class GatedDeltaNet(nn.Module):
             groups=self.conv_dim,
             padding=0,
         )
-        # Unlike qwen3_next, the projections are split.
         self.in_proj_qkv = nn.Linear(d, self.conv_dim, bias=False)
         self.in_proj_z = nn.Linear(d, self.value_dim, bias=False)
         self.in_proj_b = nn.Linear(d, self.n_v, bias=False)
@@ -665,7 +656,7 @@ class Qwen4ExpModel(nn.Module):
         mask = create_attention_mask(
             h, cache=attn_cache[0] if attn_cache is not None else None
         )
-        # The deltanet and PLE read in order, so they need the padding zeroed out.
+        # The deltanet and PLE must skip the padding.
         conv_mask = create_ssm_mask(h, cache=cache[self.first_linear])
 
         h = mx.tile(h, (1, 1, self.hc))
@@ -712,9 +703,8 @@ class Model(nn.Module):
         return caches
 
     def sanitize(self, weights: dict[str, mx.array]) -> dict[str, mx.array]:
-        # HF and mlx-vlm store these norms as `w` for a `1 + w` scale; mlx-vlm is
-        # the flat layout with `shards.{i}` n-gram names. Other flat exports and
-        # mlx-lm conversions already hold `1 + w`.
+        # HF and mlx-vlm (flat layout, `shards.{i}` n-gram names) store these norms
+        # as `w` for a `1 + w` scale; other checkpoints already hold `1 + w`.
         fold = any(
             k.startswith("model.language_model.")
             or (k.startswith("language_model.") and ".ngram_embedding.shards." in k)
@@ -729,8 +719,7 @@ class Model(nn.Module):
             if k.startswith(("model.visual.", "visual.", "vision_tower.")):
                 continue
 
-            # The original checkpoint nests the text model under
-            # `model.language_model.`, mlx-vlm under `language_model.`.
+            # Prefixes: HF `model.language_model.`, mlx-vlm `language_model.`.
             if k.startswith("model.language_model."):
                 k = "model." + k[len("model.language_model.") :]
             elif k.startswith("language_model."):
@@ -744,8 +733,7 @@ class Model(nn.Module):
             # Rename the n-gram shards to `shards.{i}`, as mlx-vlm saves them.
             k = _NGRAM_SHARD_RE.sub(r".ngram_embedding.shards.\1.", k)
 
-            # The checkpoint stacks the experts as (E, out, in); gate_up_proj holds
-            # gate, then up, on axis -2.
+            # The experts stack as (E, out, in); gate_up_proj holds gate, then up.
             if k.endswith("mlp.experts.gate_up_proj"):
                 base = k[: -len("experts.gate_up_proj")]
                 mid = v.shape[-2] // 2

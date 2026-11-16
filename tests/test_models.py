@@ -866,9 +866,8 @@ class TestModels(unittest.TestCase):
         )
         model = qwen4_exp.Model(args)
 
-        # Checkpoints split the block inject from the mix down and store the
-        # n-gram tables as row shards; HF and mlx-vlm (`shards.{i}`) store the
-        # `1 + w` norms as `w`. Each layout must sanitize to the model weights.
+        # Each checkpoint layout (split block inject, n-gram row shards, norms as `w`
+        # for HF and mlx-vlm) must sanitize to the model weights.
         ref = copy.deepcopy(model)
         nn.quantize(
             ref,
@@ -926,8 +925,7 @@ class TestModels(unittest.TestCase):
         # The runner leaves the model in float16, too coarse to compare logits.
         model.update(tree_map(lambda p: p.astype(mx.float32), model.parameters()))
 
-        # Past the indexer budget attention is sparse: a prefill into the cache,
-        # then decoding, must match one full prefill.
+        # Past the indexer budget, prefill plus decoding must match a full prefill.
         a = mx.array([list(range(2, 24))])
         full = model(a)
         cache = make_prompt_cache(model)
@@ -935,8 +933,8 @@ class TestModels(unittest.TestCase):
         steps += [model(a[:, i : i + 1], cache=cache) for i in range(15, 22)]
         self.assertTrue(mx.allclose(full, mx.concatenate(steps, axis=1), atol=1e-4))
 
-        # A batch must match each row alone: a merge left pads a fresh row next
-        # to one with state, and the batch generator right pads its prompts.
+        # A batch must match each row alone: a fresh row merged next to one with
+        # state (left padding), and right-padded prompts (batch generator).
         b = mx.array([list(range(30, 37))])
         cache = make_prompt_cache(model)
         model(a[:, :15], cache=cache)

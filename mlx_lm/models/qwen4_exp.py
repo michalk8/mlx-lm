@@ -21,7 +21,7 @@ from .base import (
     scaled_dot_product_attention,
 )
 from .cache import ArraysCache, CacheList, KVCache
-from .gated_delta import gated_delta_update
+from .gated_delta import gated_delta_update, normalize_qk
 from .switch_layers import SwitchGLU
 
 # splitmix64 constants, and the per-layer seed step of the n-gram hash.
@@ -375,9 +375,7 @@ class GatedDeltaNet(nn.Module):
         k = k.reshape(B, S, self.n_k, self.dk)
         v = v.reshape(B, S, self.n_v, self.dv)
 
-        inv_scale = self.dk**-0.5
-        q = (inv_scale**2) * mx.fast.rms_norm(q, None, eps=1e-6)
-        k = inv_scale * mx.fast.rms_norm(k, None, eps=1e-6)
+        q, k = normalize_qk(q, k, inv_scale=self.dk**-0.5, eps=1e-6)
 
         state = cache[1] if cache is not None else None
         out, state = gated_delta_update(

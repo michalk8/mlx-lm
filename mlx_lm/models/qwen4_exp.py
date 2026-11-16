@@ -1,8 +1,7 @@
 # Copyright © 2026 Apple Inc.
 
-# MLX port of Qwen3.8-Flash-Next (HF model_type: qwen4_exp)
-# New compared to qwen3_next: QSA sparse attention, gated residual
-# (hyper-connections), n-gram / PLE embedding, split deltanet projections.
+# Qwen3.8-Flash-Next: qwen3_next with QSA sparse attention, hyper-connections
+# and an n-gram embedding (PLE).
 
 from __future__ import annotations
 
@@ -65,9 +64,7 @@ class TextArgs(BaseModelArgs):
     ple_embed_dim: int = 2560
     ple_layer_ids: list = field(default_factory=lambda: [2])
     ple_conv_kernel_size: int = 4
-    # The n-gram hash seed of the reference implementation. config.json does
-    # not carry it, so the default is load-bearing: a different seed rebuilds
-    # different multipliers and every PLE lookup lands on the wrong rows.
+    # Not in config.json; the n-gram hash depends on it.
     seed: int = 1234
     eos_token_id: Any = 248044
     partial_rotary_factor: float = 0.25
@@ -98,25 +95,12 @@ class ModelArgs(BaseModelArgs):
             ]
 
 
-# --------------------------------------------------------------------------- norms
-
-
 class RMSNorm(nn.Module):
-    """Zero-centered RMSNorm: y = norm(x) * (1 + weight).
-
-    The checkpoint stores zero-centered weights, so `Qwen4ExpTextRMSNorm` scales
-    by `1 + weight` and initializes the weight to 0. Only the gated variant used
-    by the delta net is conventional, see `RMSNormGated`.
-
-    Hyper-connections normalize each of the hc_count streams separately, hence the
-    reshape: one weight of size hc_count*hidden, but one statistic per stream. The
-    scale applies to the flat vector, after the reshape, like the reference.
-    """
+    """RMSNorm with one statistic per `group_size` slice, e.g. per stream of the
+    hyper-connections. `sanitize` folds the checkpoint's `1 + w` into `weight`."""
 
     def __init__(self, dim: int, group_size: Optional[int] = None, eps: float = 1e-6):
         super().__init__()
-        # ones, not zeros: the reference scales by `1 + w` and `sanitize` folds that 1
-        # into the weight, so an unloaded module has to be the identity.
         self.weight = mx.ones(dim)
         self.eps = eps
         self.group_size = group_size
@@ -133,8 +117,7 @@ class RMSNorm(nn.Module):
 
 
 class RMSNormGated(nn.Module):
-    """Conventional RMSNorm: `Qwen4ExpTextRMSNormGated` scales by `weight` alone
-    and initializes it to 1, unlike the non-gated norm above."""
+    """RMSNorm with an optional gate; the checkpoint stores `weight` as is."""
 
     def __init__(self, dim: int, eps: float = 1e-6, activation: str = "sigmoid"):
         super().__init__()
@@ -151,15 +134,9 @@ class RMSNormGated(nn.Module):
         return (g * out.astype(mx.float32)).astype(x.dtype)
 
 
-# ------------------------------------------------------------------------ helpers
-
-
 def _positions(offset: Union[int, mx.array], S: int) -> mx.array:
-    """Positions of `S` tokens from `offset`, (1, S) or (B, S).
-
-    `offset` is an int with the usual caches, and one position per slot with a
-    batched cache (see `BatchKVCache.offset`).
-    """
+    """Positions of `S` tokens from `offset`: (1, S) for an int offset, (B, S)
+    for one offset per row."""
     if isinstance(offset, mx.array):
         return offset.reshape(-1, 1) + mx.arange(S)
     return mx.arange(offset, offset + S)[None]
@@ -184,16 +161,8 @@ def _keep_last(x: mx.array, n: int, lengths: Optional[mx.array]) -> mx.array:
     return mx.take_along_axis(x, positions, axis=1)
 
 
-# ------------------------------------------------------------------------ QSA
-
-
 class QSAIndexer(nn.Module):
-    """Select, per query, a budget of compressed key blocks.
-
-    The reference PyTorch implementation loops over (batch, query); here everything
-    is vectorized: pooled keys do not depend on the query, so they are computed once
-    and followed by a per-row top-k.
-    """
+    """Select, per query, a budget of compressed key blocks."""
 
     def __init__(self, args: TextArgs):
         super().__init__()
@@ -229,8 +198,7 @@ class QSAIndexer(nn.Module):
             raw_k = raw_k[:, 0]
         kv_len = raw_k.shape[1]
 
-        # No sparsification possible: every visible token fits in the budget, so the
-        # top-k would keep them all. The usual causal mask is enough.
+        # Every visible token fits in the budget: the causal mask is enough.
         if kv_len <= self.token_budget:
             return None
 
@@ -241,9 +209,7 @@ class QSAIndexer(nn.Module):
                 B, n_blocks, self.compress_ratio, self.head_dim
             )
         else:
-            # A block groups the tokens of one row, so it starts at the first
-            # real token of that row, not at column 0 of the shared buffer.
-            # Credit: Blaizzy/mlx-vlm#2028.
+            # A row's blocks start at its first real token (Blaizzy/mlx-vlm#2028).
             cols = (
                 pad[:, None, None]
                 + (mx.arange(n_blocks) * self.compress_ratio)[None, :, None]
@@ -260,8 +226,6 @@ class QSAIndexer(nn.Module):
             pooled.astype(mx.float32).mean(axis=2).astype(raw_k.dtype)
         )
 
-        # Block n holds the logical positions n * compress_ratio and up in every
-        # row, so the padding does not move the block rope.
         pooled = self.block_rope(pooled)
 
         q_pos = _positions(offset, S)
@@ -274,8 +238,7 @@ class QSAIndexer(nn.Module):
         )
         scores = mx.maximum(scores, 0).sum(axis=-1) / math.sqrt(self.head_dim)
 
-        # A block is only a candidate if it lies entirely in the query's past.
-        # Count real tokens: `q_pos` already excludes the left padding.
+        # Only blocks fully in the query's past; `q_pos` excludes the padding.
         n_complete = mx.maximum(q_pos + 1, 0) // self.compress_ratio
         visible = mx.arange(n_blocks)[None, None, :] < n_complete[..., None]
         scores = mx.where(visible, scores, -mx.inf)
@@ -284,8 +247,7 @@ class QSAIndexer(nn.Module):
         top = mx.argpartition(-scores, k - 1, axis=-1)[..., :k]  # (B, S, k)
         picked = mx.take_along_axis(visible, top, axis=-1)
 
-        # remap block -> tokens; the buffer's trailing partial block belongs to no
-        # candidate block, so it is not selectable on its own
+        # Blocks to tokens; a trailing partial block is never picked.
         if pad is None:
             keep_block = mx.put_along_axis(
                 mx.zeros((B, S, n_blocks + 1), dtype=mx.bool_),
@@ -300,8 +262,7 @@ class QSAIndexer(nn.Module):
                     [keep, mx.zeros((B, S, rest), dtype=mx.bool_)], axis=-1
                 )
         else:
-            # One block grid per row, so a repeat no longer expands it: scatter
-            # the winners straight on the token axis.
+            # Each row has its own block grid: scatter the picks on the token axis.
             tok = (
                 pad[:, None, None, None]
                 + top[..., None] * self.compress_ratio
@@ -317,10 +278,8 @@ class QSAIndexer(nn.Module):
                 axis=-1,
             )[..., :kv_len]
 
-        # The reference appends the tail of each query's own visible list, i.e. the
-        # partial block it sits in. Without it a query whose past holds fewer than
-        # compress_ratio tokens gets an all-masked row, which softmax turns into a
-        # uniform average over every key, future ones included.
+        # Keep each query's own partial block: an all-masked row would attend to
+        # every key, future ones included.
         own_start = n_complete * self.compress_ratio
         if pad is not None:
             own_start = own_start + pad[:, None]
@@ -377,8 +336,7 @@ class Attention(nn.Module):
             k, v = kv_cache.update_and_fetch(k, v)
 
         if sparse is not None:
-            # `sparse` is a boolean keep mask. Keep the combination boolean:
-            # adding it drops the causality held by the "causal" string.
+            # Combine as booleans; "causal" needs an explicit mask first.
             if mask is None:
                 mask = sparse
             elif isinstance(mask, str):  # "causal"
@@ -397,9 +355,6 @@ class Attention(nn.Module):
         )
         out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
         return self.o_proj(out * mx.sigmoid(gate))
-
-
-# ------------------------------------------------------------------- gated deltanet
 
 
 class GatedDeltaNet(nn.Module):
@@ -482,9 +437,6 @@ class GatedDeltaNet(nn.Module):
         return self.out_proj(self.norm(out, z).reshape(B, S, -1))
 
 
-# ------------------------------------------------------------------------- MoE
-
-
 class SparseMoeBlock(nn.Module):
     def __init__(self, args: TextArgs):
         super().__init__()
@@ -515,9 +467,6 @@ class MLP(nn.Module):
         return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
-# ------------------------------------------------------ hyper-connections (residual)
-
-
 class GatedResidual(nn.Module):
     def __init__(self, args: TextArgs, use_combine: bool = True):
         super().__init__()
@@ -527,8 +476,7 @@ class GatedResidual(nn.Module):
         self.use_combine = use_combine
         hc_dim = self.hc * self.d
         self.hc_norm = RMSNorm(hc_dim, group_size=self.d, eps=args.rms_norm_eps)
-        # With `use_combine`, the last hc rows hold the checkpoint's
-        # block_inject_weight: one matmul for both.
+        # The last hc rows are the checkpoint's block inject: one matmul for both.
         down = self.lowrank + (self.hc if use_combine else 0)
         self.input_mix_weight_down = nn.Linear(hc_dim, down, bias=False)
         self.input_mix_weight_up = nn.Linear(self.lowrank, hc_dim, bias=False)
@@ -544,9 +492,6 @@ class GatedResidual(nn.Module):
             return mixed
         inject = 2 * mx.sigmoid(down[..., self.lowrank :] / self.hc)
         return mixed, hyper, inject
-
-
-# -------------------------------------------------------------- n-gram / PLE
 
 
 _MASK64 = (1 << 64) - 1
@@ -606,7 +551,6 @@ class NGramEmbedding(nn.Module):
         # One table per head keeps each checkpoint file small (~6 GB in bf16).
         self.ngram_embedding = [nn.Embedding(s, head_dim) for s in sizes]
 
-        # buffers taken as-is from the checkpoint
         mults = []
         max_long = (1 << 63) - 1
         half = max(1, (max_long // max(args.vocab_size, 1)) // 2)
@@ -615,15 +559,7 @@ class NGramEmbedding(nn.Module):
             mults.append(
                 2 * (_splitmix64((base_seed + _GAMMA * (i + 1)) & _MASK64) % half) + 1
             )
-        # Public attributes: only there to absorb the checkpoint tensors. They live
-        # in parameters(), so an astype(float16) would destroy them; the values
-        # actually used live in the `_`-prefixed copies, outside parameters() and
-        # rebuilt from the config. `Model.sanitize` checks the rebuilt values
-        # against the checkpoint's, so a seed or hash mismatch fails loudly
-        # instead of silently reading the wrong rows.
-        self.layer_multipliers = mx.array(mults, dtype=mx.int64)
-        self.ngram_heads_vocab_sizes = mx.array(sizes, dtype=mx.int64)
-        self.ngram_heads_offsets = mx.array(offsets, dtype=mx.int64)
+        # Not parameters: rebuilt from the config, checked in `sanitize`.
         self._mults = mx.array(mults, dtype=mx.int64)
         self._sizes = mx.array(sizes, dtype=mx.int64)
         self._offsets = mx.array(offsets, dtype=mx.int64)
@@ -719,9 +655,6 @@ class PLELayer(nn.Module):
         return gated + self._short_conv(self.norm_conv(gated), cache)
 
 
-# ------------------------------------------------------------------- decoder / model
-
-
 class DecoderLayer(nn.Module):
     def __init__(self, args: TextArgs, layer_idx: int):
         super().__init__()
@@ -784,8 +717,7 @@ class Qwen4ExpModel(nn.Module):
         mask = create_attention_mask(
             h, attn_cache[0] if attn_cache is not None else None
         )
-        # The deltanet reads the tokens in order, so it needs the padded ones
-        # zeroed out. Its cache holds the padding, one value per row.
+        # The deltanet reads in order, so it needs the left padding zeroed out.
         conv_mask = create_ssm_mask(h, cache[lin_idx[0]]) if lin_idx else None
 
         h = mx.tile(h, (1, 1, self.hc))
@@ -854,8 +786,7 @@ class Model(nn.Module):
                 caches.append(ArraysCache(num_states))
         return caches
 
-    # Norms scaled by `1 + w` in the reference (RMSNorm above); `linear_attn.norm` is
-    # RMSNormGated and scales by `w` alone, so it must stay out of this list.
+    # Norms stored as `w` for a `1 + w` scale; `linear_attn.norm` is not one.
     _FOLD_ONE = (
         "q_layernorm.weight",
         "k_layernorm.weight",
@@ -868,44 +799,34 @@ class Model(nn.Module):
     )
 
     def sanitize(self, weights):
-        # Fold the reference's `1 +` into the weight here instead of at every call. Gated on
-        # the HF layout, because sanitize also runs on load: a checkpoint converted by this
-        # file comes back as `model.*`, matches nothing below, and must not be folded twice.
-        # Checkpoints from other MLX converters already carry the folded value.
+        # Fold the norms' `1 +` into the weight once: converted checkpoints have it.
         fold = any(k.startswith("model.language_model.") for k in weights)
 
         out = {}
         for k, v in weights.items():
-            # Multi-token-prediction head and vision tower: not implemented by this
-            # text-only port, and absent from the module tree -> drop them.
+            # Not in this text-only port: the MTP head and the vision tower.
             if k.startswith(("mtp.", "model.mtp.")):
                 continue
             if k.startswith(("model.visual.", "visual.", "vision_tower.")):
                 continue
 
-            # Prefix. The official checkpoint nests the text model under
-            # `model.language_model.` while already-converted MLX checkpoints use
-            # the flat `language_model.` form; both must land on `model.`.
-            # `lm_head.weight` sits at the top level upstream and is left alone.
+            # The original checkpoint nests the text model under
+            # `model.language_model.`, mlx-vlm under `language_model.`.
             if k.startswith("model.language_model."):
                 k = "model." + k[len("model.language_model.") :]
             elif k.startswith("language_model."):
                 k = k[len("language_model.") :]
 
-            # The hash constants are rebuilt from the config; the checkpoint's
-            # copies are the ground truth they must reproduce.
+            # The n-gram hash constants: check them against the config, then drop.
             if k.endswith(self._NGRAM_CONSTANTS):
                 self._check_ngram_constant(k, v)
+                continue
 
-            # N-gram table: HF names the shards `shard_{i}`, this file `shards.{i}`.
+            # Rename the n-gram shards to `shards.{i}`, as mlx-vlm saves them.
             k = _NGRAM_SHARD_RE.sub(r".ngram_embedding.shards.\1.", k)
 
-            # Experts. Upstream stacks them as `experts.gate_up_proj`
-            # (E, 2 * moe_intermediate, hidden) and `experts.down_proj`
-            # (E, hidden, moe_intermediate), i.e. already the (E, out, in) layout
-            # SwitchGLU wants. The reference splits the *output* of the fused
-            # projection with chunk(2, dim=-1), so gate is the first half of
-            # axis -2 of the weight and up the second.
+            # The checkpoint stacks the experts as (E, out, in); gate_up_proj holds
+            # gate, then up, on axis -2.
             if k.endswith("mlp.experts.gate_up_proj"):
                 base = k[: -len("experts.gate_up_proj")]
                 mid = v.shape[-2] // 2
@@ -917,8 +838,7 @@ class Model(nn.Module):
                 out[base + "switch_mlp.down_proj.weight"] = v
                 continue
 
-            # (C, 1, K) torch -> (C, K, 1) mlx. Idempotent: an already converted
-            # weight has shape[1] == kernel_size != 1.
+            # torch (C, 1, K) to mlx (C, K, 1); a converted weight has shape[1] > 1.
             if k.endswith("conv1d.weight") and v.ndim == 3 and v.shape[1] == 1:
                 v = v.transpose(0, 2, 1)
 
@@ -927,8 +847,7 @@ class Model(nn.Module):
 
             out[k] = v
 
-        # The checkpoint keeps the hyper-connections' block inject apart from
-        # their mix down.
+        # Merge the checkpoint's block inject into the mix down.
         for k in [k for k in out if k.endswith("block_inject_weight.weight")]:
             p = k[: -len("block_inject_weight.weight")]
             down = p + "input_mix_weight_down"
@@ -967,11 +886,8 @@ class Model(nn.Module):
 
     @property
     def quant_predicate(self):
-        # mlx-lm 0.31.3 calls predicates with two arguments, later versions with
-        # three; the default keeps both conventions working
-        def fn(path, module, _=None):
-            # only the MoE router stays in full precision (norms and conv1d are
-            # never quantized anyway)
+        def predicate(path, _):
+            # The MoE router stays in full precision.
             return not path.endswith("mlp.gate")
 
-        return fn
+        return predicate

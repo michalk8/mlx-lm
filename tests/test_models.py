@@ -823,10 +823,8 @@ class TestModels(unittest.TestCase):
         )
 
     def test_qwen4_exp_ngram_constants_are_checked(self):
-        """The n-gram hash constants (layer_multipliers and friends) are rebuilt
-        from the config -- the seed is not in config.json -- and the checkpoint
-        carries the reference's copies. A rebuild that disagrees must fail loudly
-        at load, not read the wrong rows of the n-gram table in silence."""
+        """`sanitize` checks the checkpoint's n-gram hash constants against the
+        ones rebuilt from the config, and drops them."""
         from mlx_lm.models import qwen4_exp
 
         text_config = dict(
@@ -869,23 +867,19 @@ class TestModels(unittest.TestCase):
             qwen4_exp.ModelArgs(model_type="qwen4_exp", text_config=text_config)
         )
         weights = dict(tree_flatten(model.parameters()))
-        key = next(k for k in weights if k.endswith("ple_embedding.layer_multipliers"))
-        layer = int(key.split(".layers.")[1].split(".")[0])
-        table = model.model.layers[layer].ple.ple_embedding
-        self.assertTrue(mx.array_equal(weights[key], table._mults))
-        model.sanitize(dict(weights))  # matching constants pass
+        key = "model.layers.1.ple.ple_embedding.layer_multipliers"
+        mults = model.model.layers[1].ple.ple_embedding._mults
+        self.assertNotIn(key, model.sanitize({**weights, key: mults}))
 
-        # A different seed rebuilds the hash constants, so the checkpoint's copies
-        # no longer match and sanitize must reject them instead of degrading.
+        # A different seed rebuilds different multipliers.
         wrong = qwen4_exp.Model(
             qwen4_exp.ModelArgs(
                 model_type="qwen4_exp", text_config={**text_config, "seed": 0}
             )
         )
-        bad = dict(tree_flatten(wrong.parameters()))
-        self.assertFalse(mx.array_equal(bad[key], weights[key]))
+        bad = wrong.model.layers[1].ple.ple_embedding._mults
         with self.assertRaises(ValueError):
-            model.sanitize(bad)
+            model.sanitize({**weights, key: bad})
 
     def test_qwen4_exp(self):
         from mlx_lm.models import qwen4_exp
